@@ -7,7 +7,7 @@ import IntradayChart from "./IntradayChart";
 // ============================================================
 
 const BACKEND =
-  import.meta.env.VITE_BACKEND_URL || "https://127.0.0.1:8000";
+  import.meta.env.VITE_BACKEND_URL || "https://stock-analyser-6t4o.onrender.com";
 
 const PAPER_STOCK_OPTIONS = [
   ["RELIANCE", "Reliance Industries"],

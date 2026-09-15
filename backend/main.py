@@ -1,9 +1,13 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pathlib import Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import json
 import sqlite3
+import os
+import hmac
+import hashlib
+import base64
 
 import yfinance as yf
 import pandas as pd
@@ -42,6 +46,130 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# PASSWORD AUTHENTICATION
+# ============================================================
+
+APP_USERNAME = os.getenv("APP_USERNAME", "").strip()
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+AUTH_TOKEN_DAYS = 30
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def _auth_configured():
+    return bool(APP_USERNAME and APP_PASSWORD)
+
+
+def _auth_signing_key() -> bytes:
+    # No separate AUTH_SECRET environment variable is required.
+    # Derive a signing key from the configured password without exposing it to the frontend.
+    return hashlib.sha256(("stock-analyser-auth-v1:" + APP_PASSWORD).encode("utf-8")).digest()
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def _b64url_decode(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def create_auth_token(username: str) -> str:
+    expires_at = int(time.time()) + AUTH_TOKEN_DAYS * 24 * 60 * 60
+    payload = json.dumps(
+        {"username": username, "exp": expires_at},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload_part = _b64url_encode(payload)
+    signature = hmac.new(
+        _auth_signing_key(),
+        payload_part.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return f"{payload_part}.{_b64url_encode(signature)}"
+
+
+def verify_auth_token(token: str):
+    if not _auth_configured() or not token or "." not in token:
+        return None
+    try:
+        payload_part, signature_part = token.split(".", 1)
+        expected = hmac.new(
+            _auth_signing_key(),
+            payload_part.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        supplied = _b64url_decode(signature_part)
+        if not hmac.compare_digest(expected, supplied):
+            return None
+        payload = json.loads(_b64url_decode(payload_part).decode("utf-8"))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        if payload.get("username") != APP_USERNAME:
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+@app.middleware("http")
+async def require_authentication(request: Request, call_next):
+    path = request.url.path
+    public_paths = {"/", "/api/health", "/api/auth/login"}
+
+    if request.method == "OPTIONS" or path in public_paths or not path.startswith("/api/"):
+        return await call_next(request)
+
+    if not _auth_configured():
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Authentication is not configured. Set APP_USERNAME and APP_PASSWORD on the server."
+            },
+        )
+
+    authorization = request.headers.get("Authorization", "")
+    token = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
+    payload = verify_auth_token(token)
+    if not payload:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=401, content={"detail": "Login required"})
+
+    request.state.auth_user = payload.get("username")
+    return await call_next(request)
+
+
+@app.post("/api/auth/login")
+def auth_login(credentials: LoginRequest):
+    if not _auth_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is not configured on the server.",
+        )
+
+    username_ok = hmac.compare_digest(credentials.username.strip(), APP_USERNAME)
+    password_ok = hmac.compare_digest(credentials.password, APP_PASSWORD)
+    if not (username_ok and password_ok):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    return {
+        "status": "ok",
+        "username": APP_USERNAME,
+        "token": create_auth_token(APP_USERNAME),
+        "expires_in_days": AUTH_TOKEN_DAYS,
+    }
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    return {"authenticated": True, "username": request.state.auth_user}
 
 
 # ============================================================

@@ -119,13 +119,21 @@ function signalBackground(signal) {
 }
 
 async function fetchJson(url, options = {}) {
+  const token = window.localStorage.getItem("stock_analyser_auth_token");
+
   const response = await fetch(url, {
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers || {}),
     },
   });
+
+  if (response.status === 401) {
+    window.localStorage.removeItem("stock_analyser_auth_token");
+    window.dispatchEvent(new Event("stock-analyser-auth-required"));
+  }
 
   if (!response.ok) {
     let message = `HTTP ${response.status}`;
@@ -289,6 +297,13 @@ function StatusBadge({ signal }) {
 // ============================================================
 
 export default function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+
   // ==========================================================
   // STOCK STATE
   // ==========================================================
@@ -1453,12 +1468,38 @@ export default function App() {
   // ==========================================================
 
   useEffect(() => {
+    async function restoreLogin() {
+      const token = window.localStorage.getItem("stock_analyser_auth_token");
+      if (!token) {
+        setAuthChecking(false);
+        return;
+      }
+      try {
+        await fetchJson(`${BACKEND}/api/auth/me`);
+        setIsAuthenticated(true);
+      } catch {
+        window.localStorage.removeItem("stock_analyser_auth_token");
+        setIsAuthenticated(false);
+      } finally {
+        setAuthChecking(false);
+      }
+    }
+
+    const requireLogin = () => setIsAuthenticated(false);
+    window.addEventListener("stock-analyser-auth-required", requireLogin);
+    restoreLogin();
+    return () =>
+      window.removeEventListener("stock-analyser-auth-required", requireLogin);
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
     checkBackend();
     loadStock("NIFTY 50");
     loadPaperData();
     loadDayTradeData();
     loadIntraday("NIFTY 50");
-  }, []);
+  }, [isAuthenticated]);
 
   // ==========================================================
   // RELOAD DAILY DATA WHEN PERIOD CHANGES
@@ -1784,6 +1825,44 @@ export default function App() {
   ];
 
   // ==========================================================
+  // AUTHENTICATION UI
+  // ==========================================================
+
+  async function handleLogin(event) {
+    event.preventDefault();
+    setLoginError("");
+    setLoginLoading(true);
+    try {
+      const response = await fetch(`${BACKEND}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: loginUsername.trim(),
+          password: loginPassword,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data?.token) {
+        throw new Error(data?.detail || "Login failed");
+      }
+      window.localStorage.setItem("stock_analyser_auth_token", data.token);
+      setLoginPassword("");
+      setIsAuthenticated(true);
+    } catch (err) {
+      setLoginError(err?.message || "Unable to sign in.");
+    } finally {
+      setLoginLoading(false);
+      setAuthChecking(false);
+    }
+  }
+
+  function handleLogout() {
+    window.localStorage.removeItem("stock_analyser_auth_token");
+    setIsAuthenticated(false);
+    setBackendStatus("Checking...");
+  }
+
+  // ==========================================================
   // RENDER
   // ==========================================================
 
@@ -1805,6 +1884,33 @@ export default function App() {
     tradeNotificationsEnabled,
   ]);
 
+
+  if (authChecking) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#f1f5f9", fontFamily: "Inter, system-ui, sans-serif" }}>
+        <div style={{ fontWeight: 800, color: "#0f172a" }}>Checking login…</div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 20, background: "#f1f5f9", fontFamily: "Inter, system-ui, sans-serif" }}>
+        <form onSubmit={handleLogin} style={{ width: "100%", maxWidth: 390, background: "white", padding: 28, borderRadius: 18, boxShadow: "0 12px 35px rgba(15,23,42,.12)", border: "1px solid #e2e8f0" }}>
+          <h1 style={{ margin: 0, color: "#0f172a", fontSize: 25 }}>Vishnu Stock Analyzer</h1>
+          <p style={{ color: "#64748b", marginTop: 8, marginBottom: 22 }}>Sign in to access analysis and paper trading.</p>
+          <label style={{ display: "block", fontWeight: 700, marginBottom: 6 }}>Username</label>
+          <input value={loginUsername} onChange={(e) => setLoginUsername(e.target.value)} autoComplete="username" required style={{ width: "100%", boxSizing: "border-box", padding: 12, border: "1px solid #cbd5e1", borderRadius: 10, marginBottom: 16, fontSize: 16 }} />
+          <label style={{ display: "block", fontWeight: 700, marginBottom: 6 }}>Password</label>
+          <input type="password" value={loginPassword} onChange={(e) => setLoginPassword(e.target.value)} autoComplete="current-password" required style={{ width: "100%", boxSizing: "border-box", padding: 12, border: "1px solid #cbd5e1", borderRadius: 10, marginBottom: 16, fontSize: 16 }} />
+          {loginError && <div style={{ color: "#b91c1c", background: "#fee2e2", padding: 10, borderRadius: 9, marginBottom: 14 }}>{loginError}</div>}
+          <button type="submit" disabled={loginLoading} style={{ width: "100%", border: 0, borderRadius: 10, padding: 13, background: "#0f172a", color: "white", fontWeight: 800, fontSize: 16, cursor: "pointer" }}>
+            {loginLoading ? "Signing in…" : "Sign In"}
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -1864,7 +1970,22 @@ export default function App() {
             </div>
           </div>
 
-          <div
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <button
+              onClick={handleLogout}
+              style={{
+                border: "1px solid #475569",
+                background: "#1e293b",
+                color: "#ffffff",
+                padding: "8px 13px",
+                borderRadius: 999,
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              Logout
+            </button>
+            <div
             style={{
               display: "flex",
               alignItems: "center",
@@ -1886,6 +2007,7 @@ export default function App() {
             />
 
             Backend: {backendStatus}
+            </div>
           </div>
         </div>
       </header>

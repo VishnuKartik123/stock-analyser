@@ -1,0 +1,28 @@
+# Python
+backend/venv/
+__pycache__/
+*.pyc
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Secrets
+.env
+backend/.env
+frontend/.env
+
+# Certificates
+backend/key.pem
+backend/cert.pem
+*.pem
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Misc
+.vscode/
+.DS_Store
+Thumbs.db

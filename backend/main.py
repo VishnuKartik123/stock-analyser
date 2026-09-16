@@ -312,28 +312,93 @@ def save_all_intraday_trade_history():
 intraday_paper_trades = load_intraday_trade_history()
 
 
-# Qualified scanner suggestions are stored in the same durable database.
+# ============================================================
+# INTRADAY SCANNER LEARNING / END-OF-DAY OBSERVATIONS
+# ============================================================
+#
+# Daily operating plan (India time):
+#   09:15-09:45  -> observe only; never qualify a new suggestion
+#   09:45-14:45  -> normal strict qualification
+#   14:45-15:15  -> conservative qualification
+#   15:15-15:30  -> no new suggestions; manage open positions only
+#   after 15:30  -> evaluate saved candidates and create a daily review
+#
+# The learning layer is intentionally conservative. It never "learns" from
+# one trade and immediately rewrites the strategy. Historical setup outcomes
+# are used only after a minimum sample exists.
+# ============================================================
+
 MAX_QUALIFIED_SUGGESTIONS_PER_DAY = 5
 QUALIFIED_MIN_SCORE = 7
 QUALIFIED_MIN_RISK_REWARD = 1.80
 QUALIFIED_MIN_VOLUME_RATIO = 1.00
 
+LATE_SESSION_START_MINUTES = 14 * 60 + 45
+NEW_ENTRY_CUTOFF_MINUTES = 15 * 60 + 15
+MARKET_SETTLED_MINUTES = 9 * 60 + 45
+
+# Late-session entries must be stronger because less trading time remains.
+LATE_QUALIFIED_MIN_SCORE = 8
+LATE_QUALIFIED_MIN_RISK_REWARD = 2.00
+LATE_QUALIFIED_MIN_VOLUME_RATIO = 1.20
+
+# Do not use historical performance as a gate until enough resolved examples
+# exist. This avoids overfitting a handful of trades.
+HISTORICAL_MIN_SAMPLE = 20
+HISTORICAL_MIN_SUCCESS_RATE = 0.45
+
+
 def init_scanner_signal_db():
     with sqlite3.connect(TRADE_HISTORY_DB) as connection:
         connection.execute("""
             CREATE TABLE IF NOT EXISTS scanner_signal_history (
-                id TEXT PRIMARY KEY, trade_date TEXT NOT NULL, timestamp TEXT NOT NULL,
-                symbol TEXT NOT NULL, side TEXT NOT NULL, signal_json TEXT NOT NULL
+                id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                signal_json TEXT NOT NULL
             )
         """)
+
+        # One durable snapshot per symbol/side/date. This includes both
+        # qualified and rejected BUY/SELL candidates so later statistics are
+        # not based only on trades we liked.
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS scanner_candidate_history (
+                id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qualified INTEGER NOT NULL DEFAULT 0,
+                resolved INTEGER NOT NULL DEFAULT 0,
+                candidate_json TEXT NOT NULL,
+                outcome_json TEXT
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS scanner_daily_review (
+                trade_date TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                review_json TEXT NOT NULL
+            )
+        """)
+
         connection.commit()
+
 
 def scanner_signal_count_today():
     init_scanner_signal_db()
     day = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
     with sqlite3.connect(TRADE_HISTORY_DB) as connection:
-        row = connection.execute("SELECT COUNT(*) FROM scanner_signal_history WHERE trade_date=?", (day,)).fetchone()
+        row = connection.execute(
+            "SELECT COUNT(*) FROM scanner_signal_history WHERE trade_date=?",
+            (day,),
+        ).fetchone()
     return int(row[0] if row else 0)
+
 
 def store_qualified_signal(result):
     init_scanner_signal_db()
@@ -342,31 +407,468 @@ def store_qualified_signal(result):
     symbol = clean_symbol(result.get("symbol", ""))
     side = str(result.get("signal", "")).upper()
     signal_id = f"{day}:{symbol}:{side}"
+
     with sqlite3.connect(TRADE_HISTORY_DB) as connection:
         before = connection.total_changes
-        connection.execute("INSERT OR IGNORE INTO scanner_signal_history (id,trade_date,timestamp,symbol,side,signal_json) VALUES (?,?,?,?,?,?)",
-            (signal_id, day, now.isoformat(), symbol, side, json.dumps(result, ensure_ascii=False, default=str)))
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO scanner_signal_history
+            (id,trade_date,timestamp,symbol,side,signal_json)
+            VALUES (?,?,?,?,?,?)
+            """,
+            (
+                signal_id,
+                day,
+                now.isoformat(),
+                symbol,
+                side,
+                json.dumps(result, ensure_ascii=False, default=str),
+            ),
+        )
         connection.commit()
         inserted = connection.total_changes > before
+
     return signal_id, inserted
+
+
+def store_scanner_candidate(result):
+    """Persist the latest BUY/SELL candidate snapshot for later evaluation."""
+    init_scanner_signal_db()
+
+    signal = str(result.get("signal", "")).upper()
+    if signal not in ("BUY", "SELL"):
+        return None
+
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    day = now.date().isoformat()
+    symbol = clean_symbol(result.get("symbol", ""))
+    candidate_id = f"{day}:{symbol}:{signal}"
+
+    snapshot = dict(result)
+    snapshot["candidate_id"] = candidate_id
+    snapshot["captured_at"] = now.isoformat()
+
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        existing = connection.execute(
+            """
+            SELECT resolved
+            FROM scanner_candidate_history
+            WHERE id=?
+            """,
+            (candidate_id,),
+        ).fetchone()
+
+        # Never overwrite an already resolved historical observation.
+        if existing and int(existing[0] or 0) == 1:
+            return candidate_id
+
+        connection.execute(
+            """
+            INSERT INTO scanner_candidate_history
+            (id,trade_date,timestamp,symbol,side,qualified,resolved,candidate_json,outcome_json)
+            VALUES (?,?,?,?,?,?,0,?,NULL)
+            ON CONFLICT(id) DO UPDATE SET
+                timestamp=excluded.timestamp,
+                qualified=MAX(scanner_candidate_history.qualified, excluded.qualified),
+                candidate_json=excluded.candidate_json
+            """,
+            (
+                candidate_id,
+                day,
+                now.isoformat(),
+                symbol,
+                signal,
+                1 if result.get("qualified") is True else 0,
+                json.dumps(snapshot, ensure_ascii=False, default=str),
+            ),
+        )
+        connection.commit()
+
+    return candidate_id
+
+
+def _historical_setup_stats(side):
+    """Return resolved historical performance for a BUY or SELL setup."""
+    init_scanner_signal_db()
+    side = str(side or "").upper()
+
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        rows = connection.execute(
+            """
+            SELECT outcome_json
+            FROM scanner_candidate_history
+            WHERE side=? AND resolved=1 AND outcome_json IS NOT NULL
+            ORDER BY trade_date DESC
+            LIMIT 250
+            """,
+            (side,),
+        ).fetchall()
+
+    outcomes = []
+    for (raw,) in rows:
+        try:
+            item = json.loads(raw)
+            if isinstance(item, dict):
+                outcomes.append(item)
+        except Exception:
+            continue
+
+    sample = len(outcomes)
+    successes = sum(
+        1 for x in outcomes
+        if x.get("result") in ("T1_FIRST", "T2_FIRST")
+    )
+    failures = sum(1 for x in outcomes if x.get("result") == "SL_FIRST")
+    unresolved = max(0, sample - successes - failures)
+    success_rate = (successes / sample) if sample else None
+
+    return {
+        "sample_size": sample,
+        "successes": successes,
+        "failures": failures,
+        "other": unresolved,
+        "success_rate": round(success_rate, 4) if success_rate is not None else None,
+        "sufficient_sample": sample >= HISTORICAL_MIN_SAMPLE,
+    }
+
 
 def is_qualified_setup(result):
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    minutes = now.hour * 60 + now.minute
     signal = str(result.get("signal", "")).upper()
     score = abs(safe_float(result.get("score")) or 0)
     rr = safe_float(result.get("risk_reward")) or 0
     volume = safe_float(result.get("volume_ratio")) or 0
+
+    settling = (9 * 60 + 15) <= minutes < MARKET_SETTLED_MINUTES
+    late_session = LATE_SESSION_START_MINUTES <= minutes < NEW_ENTRY_CUTOFF_MINUTES
+    new_entries_allowed = MARKET_SETTLED_MINUTES <= minutes < NEW_ENTRY_CUTOFF_MINUTES
+
+    min_score = LATE_QUALIFIED_MIN_SCORE if late_session else QUALIFIED_MIN_SCORE
+    min_rr = (
+        LATE_QUALIFIED_MIN_RISK_REWARD
+        if late_session
+        else QUALIFIED_MIN_RISK_REWARD
+    )
+    min_volume = (
+        LATE_QUALIFIED_MIN_VOLUME_RATIO
+        if late_session
+        else QUALIFIED_MIN_VOLUME_RATIO
+    )
+
+    historical = _historical_setup_stats(signal)
+    historical_ok = (
+        not historical["sufficient_sample"]
+        or (
+            historical["success_rate"] is not None
+            and historical["success_rate"] >= HISTORICAL_MIN_SUCCESS_RATE
+        )
+    )
+
     checks = {
-        "after_0945": (now.hour * 60 + now.minute) >= (9 * 60 + 45),
+        "market_settled": not settling and minutes >= MARKET_SETTLED_MINUTES,
         "market_open": get_market_status() == "OPEN",
+        "new_entries_allowed": new_entries_allowed,
         "buy_or_sell": signal in ("BUY", "SELL"),
-        "score": score >= QUALIFIED_MIN_SCORE,
-        "risk_reward": rr >= QUALIFIED_MIN_RISK_REWARD,
-        "volume": volume >= QUALIFIED_MIN_VOLUME_RATIO,
+        "score": score >= min_score,
+        "risk_reward": rr >= min_rr,
+        "volume": volume >= min_volume,
         "margin": bool(result.get("margin_band_eligible")),
+        "historical_filter": historical_ok,
     }
-    quality = round(sum(checks.values()) / len(checks) * 10, 1)
+
+    # Setup quality describes how many qualification checks passed. It is not
+    # a probability of profit.
+    quality = round(sum(bool(x) for x in checks.values()) / len(checks) * 10, 1)
+
+    result["session_phase"] = (
+        "MARKET_SETTLING"
+        if settling
+        else "NORMAL_SCAN"
+        if MARKET_SETTLED_MINUTES <= minutes < LATE_SESSION_START_MINUTES
+        else "CONSERVATIVE_SCAN"
+        if late_session
+        else "NO_NEW_ENTRIES"
+    )
+    result["historical_observation"] = historical
+    result["qualification_thresholds"] = {
+        "min_score": min_score,
+        "min_risk_reward": min_rr,
+        "min_volume_ratio": min_volume,
+    }
+
     return all(checks.values()), quality, checks
+
+
+def _candidate_outcome_from_intraday_data(candidate, df):
+    """Evaluate which level was reached first after a candidate was captured."""
+    if df is None or df.empty:
+        return None
+
+    side = str(candidate.get("signal") or candidate.get("side") or "").upper()
+    entry = safe_float(candidate.get("entry_price"))
+    stop = safe_float(candidate.get("stop_loss"))
+    t1 = safe_float(candidate.get("target_1") or candidate.get("target1"))
+    t2 = safe_float(candidate.get("target_2") or candidate.get("target2"))
+
+    if side not in ("BUY", "SELL") or entry is None or stop is None or t1 is None:
+        return None
+
+    captured_at = candidate.get("captured_at") or candidate.get("last_update")
+    working = df.copy()
+
+    try:
+        if captured_at:
+            captured = pd.Timestamp(captured_at)
+            if working.index.tz is not None:
+                if captured.tzinfo is None:
+                    captured = captured.tz_localize("Asia/Kolkata")
+                captured = captured.tz_convert(working.index.tz)
+            elif captured.tzinfo is not None:
+                captured = captured.tz_convert("Asia/Kolkata").tz_localize(None)
+            working = working[working.index >= captured]
+    except Exception:
+        pass
+
+    if working.empty:
+        return None
+
+    mfe = 0.0
+    mae = 0.0
+    first_event = None
+    first_event_time = None
+    first_event_price = None
+    t2_hit_anytime = False
+
+    for idx, row in working.iterrows():
+        high = safe_float(row.get("High"))
+        low = safe_float(row.get("Low"))
+        if high is None or low is None:
+            continue
+
+        if side == "BUY":
+            mfe = max(mfe, high - entry)
+            mae = max(mae, entry - low)
+            sl_hit = low <= stop
+            t1_hit = high >= t1
+            t2_hit = t2 is not None and high >= t2
+        else:
+            mfe = max(mfe, entry - low)
+            mae = max(mae, high - entry)
+            sl_hit = high >= stop
+            t1_hit = low <= t1
+            t2_hit = t2 is not None and low <= t2
+
+        t2_hit_anytime = t2_hit_anytime or t2_hit
+
+        # With OHLC candles we cannot know the intrabar order if both stop and
+        # target are touched in the same candle. Mark it ambiguous rather than
+        # inventing a winner.
+        if first_event is None:
+            if sl_hit and (t1_hit or t2_hit):
+                first_event = "AMBIGUOUS_SAME_CANDLE"
+                first_event_time = str(idx)
+                first_event_price = None
+            elif sl_hit:
+                first_event = "SL_FIRST"
+                first_event_time = str(idx)
+                first_event_price = stop
+            elif t2_hit:
+                first_event = "T2_FIRST"
+                first_event_time = str(idx)
+                first_event_price = t2
+            elif t1_hit:
+                first_event = "T1_FIRST"
+                first_event_time = str(idx)
+                first_event_price = t1
+
+    last_close = safe_float(working.iloc[-1].get("Close"))
+
+    if first_event is None:
+        first_event = "NO_LEVEL_HIT"
+
+    return {
+        "resolved_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+        "result": first_event,
+        "first_event_time": first_event_time,
+        "first_event_price": first_event_price,
+        "t2_hit_anytime": bool(t2_hit_anytime),
+        "mfe_per_share": round(mfe, 4),
+        "mae_per_share": round(mae, 4),
+        "last_close": last_close,
+        "entry_price": entry,
+        "stop_loss": stop,
+        "target_1": t1,
+        "target_2": t2,
+    }
+
+
+def run_end_of_day_review(trade_date=None, force=False):
+    """
+    Resolve saved scanner candidates after the NSE session and persist a
+    durable daily report. Safe to call repeatedly.
+    """
+    init_scanner_signal_db()
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    day = str(trade_date or now.date().isoformat())
+    minutes = now.hour * 60 + now.minute
+
+    if not force and day == now.date().isoformat() and minutes < (15 * 60 + 30):
+        return {
+            "status": "waiting_for_market_close",
+            "trade_date": day,
+            "message": "End-of-day review becomes available after 15:30 IST.",
+        }
+
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, candidate_json, qualified, resolved, outcome_json
+            FROM scanner_candidate_history
+            WHERE trade_date=?
+            ORDER BY timestamp ASC
+            """,
+            (day,),
+        ).fetchall()
+
+    resolved_now = 0
+    outcomes = []
+
+    for candidate_id, raw_candidate, qualified, resolved, raw_outcome in rows:
+        try:
+            candidate = json.loads(raw_candidate)
+        except Exception:
+            continue
+
+        if resolved and raw_outcome:
+            try:
+                outcomes.append({
+                    "candidate": candidate,
+                    "qualified": bool(qualified),
+                    "outcome": json.loads(raw_outcome),
+                })
+            except Exception:
+                pass
+            continue
+
+        symbol = clean_symbol(candidate.get("symbol", ""))
+        if not symbol:
+            continue
+
+        try:
+            df = get_history(symbol, "5d", "5m")
+            outcome = _candidate_outcome_from_intraday_data(candidate, df)
+        except Exception as error:
+            outcome = {
+                "resolved_at": now.isoformat(),
+                "result": "DATA_ERROR",
+                "error": str(error),
+            }
+
+        if not outcome:
+            continue
+
+        with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+            connection.execute(
+                """
+                UPDATE scanner_candidate_history
+                SET resolved=1, outcome_json=?
+                WHERE id=?
+                """,
+                (
+                    json.dumps(outcome, ensure_ascii=False, default=str),
+                    candidate_id,
+                ),
+            )
+            connection.commit()
+
+        resolved_now += 1
+        outcomes.append({
+            "candidate": candidate,
+            "qualified": bool(qualified),
+            "outcome": outcome,
+        })
+
+    total = len(outcomes)
+    qualified_count = sum(1 for x in outcomes if x["qualified"])
+    t1_or_t2 = sum(
+        1 for x in outcomes
+        if x["outcome"].get("result") in ("T1_FIRST", "T2_FIRST")
+    )
+    stop_first = sum(
+        1 for x in outcomes if x["outcome"].get("result") == "SL_FIRST"
+    )
+    ambiguous = sum(
+        1 for x in outcomes
+        if x["outcome"].get("result") == "AMBIGUOUS_SAME_CANDLE"
+    )
+
+    review = {
+        "trade_date": day,
+        "created_at": now.isoformat(),
+        "candidate_count": total,
+        "qualified_count": qualified_count,
+        "target_first_count": t1_or_t2,
+        "stop_first_count": stop_first,
+        "ambiguous_count": ambiguous,
+        "resolved_now": resolved_now,
+        "buy_history": _historical_setup_stats("BUY"),
+        "sell_history": _historical_setup_stats("SELL"),
+        "learning_policy": {
+            "minimum_sample_before_filtering": HISTORICAL_MIN_SAMPLE,
+            "minimum_success_rate": HISTORICAL_MIN_SUCCESS_RATE,
+            "note": (
+                "Historical outcomes are an additional filter only after "
+                "the minimum sample is reached; one day never rewrites the strategy."
+            ),
+        },
+    }
+
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        connection.execute(
+            """
+            INSERT INTO scanner_daily_review (trade_date,created_at,review_json)
+            VALUES (?,?,?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                created_at=excluded.created_at,
+                review_json=excluded.review_json
+            """,
+            (
+                day,
+                now.isoformat(),
+                json.dumps(review, ensure_ascii=False, default=str),
+            ),
+        )
+        connection.commit()
+
+    return {"status": "success", "review": review}
+
+
+def load_daily_review(trade_date=None):
+    init_scanner_signal_db()
+    day = str(
+        trade_date
+        or datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    )
+
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        row = connection.execute(
+            """
+            SELECT review_json
+            FROM scanner_daily_review
+            WHERE trade_date=?
+            """,
+            (day,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
 
 init_scanner_signal_db()
 
@@ -2135,6 +2637,34 @@ def intraday_scanner(
             detail="interval must be 5m or 15m"
         )
 
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    minutes = now_ist.hour * 60 + now_ist.minute
+    market_status = get_market_status()
+
+    if now_ist.weekday() >= 5:
+        session_phase = "MARKET_CLOSED"
+    elif minutes < (9 * 60 + 15):
+        session_phase = "PRE_MARKET"
+    elif minutes < MARKET_SETTLED_MINUTES:
+        session_phase = "MARKET_SETTLING"
+    elif minutes < LATE_SESSION_START_MINUTES:
+        session_phase = "NORMAL_SCAN"
+    elif minutes < NEW_ENTRY_CUTOFF_MINUTES:
+        session_phase = "CONSERVATIVE_SCAN"
+    elif minutes <= (15 * 60 + 30):
+        session_phase = "NO_NEW_ENTRIES"
+    else:
+        session_phase = "END_OF_DAY"
+
+    # Calling the scanner after the close automatically performs the durable
+    # end-of-day observation pass once data is available.
+    eod_review = None
+    if session_phase == "END_OF_DAY":
+        try:
+            eod_review = run_end_of_day_review()
+        except Exception as error:
+            eod_review = {"status": "error", "detail": str(error)}
+
     cache_key = f"scanner_{interval}"
     cached = scanner_cache.get(cache_key)
     now_ts = time.time()
@@ -2146,6 +2676,8 @@ def intraday_scanner(
     ):
         payload = dict(cached["payload"])
         payload["cached"] = True
+        payload["session_phase"] = session_phase
+        payload["end_of_day_review"] = eod_review
         return payload
 
     def scan_one(item):
@@ -2190,13 +2722,16 @@ def intraday_scanner(
                 "margin_rate": INTRADAY_MARGIN_RATE,
                 "max_leverage": INTRADAY_MAX_LEVERAGE,
                 "exit_rules": [],
+                "qualified": False,
+                "setup_quality": 0,
+                "session_phase": session_phase,
                 "error": str(error),
             }
 
     results = []
 
-    # A small worker pool makes the scan much faster than 50+ sequential
-    # downloads while still keeping request pressure moderate.
+    # The scanner may still collect observations while the market is settling,
+    # but qualification is blocked by is_qualified_setup().
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [
             executor.submit(scan_one, stock)
@@ -2206,19 +2741,41 @@ def intraday_scanner(
         for future in as_completed(futures):
             results.append(future.result())
 
-    # Apply a strict qualification gate and cap NEW suggestions at five/day.
-    slots = max(0, MAX_QUALIFIED_SUGGESTIONS_PER_DAY - scanner_signal_count_today())
-    ranked = sorted(results, key=lambda r: (-abs(float(r.get("score") or 0)), -float(r.get("risk_reward") or 0)))
+    # Rank first, then apply the strict qualification gate. New suggestions
+    # are capped at five for the entire trading day.
+    slots = max(
+        0,
+        MAX_QUALIFIED_SUGGESTIONS_PER_DAY - scanner_signal_count_today()
+    )
+
+    ranked = sorted(
+        results,
+        key=lambda r: (
+            -abs(float(r.get("score") or 0)),
+            -float(r.get("risk_reward") or 0),
+        ),
+    )
+
     for result in ranked:
         qualified, quality, checks = is_qualified_setup(result)
         result["setup_quality"] = quality
         result["qualification_checks"] = checks
         result["qualified"] = False
+
         if qualified:
-            day = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
-            signal_id = f"{day}:{clean_symbol(result.get('symbol',''))}:{str(result.get('signal','')).upper()}"
+            day = now_ist.date().isoformat()
+            signal_id = (
+                f"{day}:"
+                f"{clean_symbol(result.get('symbol',''))}:"
+                f"{str(result.get('signal','')).upper()}"
+            )
+
             with sqlite3.connect(TRADE_HISTORY_DB) as connection:
-                exists = connection.execute("SELECT 1 FROM scanner_signal_history WHERE id=?", (signal_id,)).fetchone() is not None
+                exists = connection.execute(
+                    "SELECT 1 FROM scanner_signal_history WHERE id=?",
+                    (signal_id,),
+                ).fetchone() is not None
+
             if exists:
                 result["qualified"] = True
                 result["signal_id"] = signal_id
@@ -2229,6 +2786,12 @@ def intraday_scanner(
                 if inserted:
                     slots -= 1
 
+        # Persist BUY/SELL candidates whether they passed or failed the gate.
+        # This gives the next-day historical filter a less biased dataset.
+        candidate_id = store_scanner_candidate(result)
+        if candidate_id:
+            result["candidate_id"] = candidate_id
+
     signal_order = {
         "BUY": 0,
         "SELL": 1,
@@ -2238,20 +2801,52 @@ def intraday_scanner(
 
     results.sort(
         key=lambda x: (
+            0 if x.get("qualified") is True else 1,
             signal_order.get(x.get("signal"), 4),
-            0 if x.get("margin_band_eligible") else 1,
-            -int(x.get("confidence") or 0),
+            -float(x.get("setup_quality") or 0),
             -abs(int(x.get("score") or 0)),
         )
     )
 
-    buys = [x for x in results if x.get("signal") == "BUY"]
-    sells = [x for x in results if x.get("signal") == "SELL"]
-    waits = [x for x in results if x.get("signal") in ["WAIT", "NO TRADE"]]
+    buys = [
+        x for x in results
+        if x.get("signal") == "BUY" and x.get("qualified") is True
+    ]
+    sells = [
+        x for x in results
+        if x.get("signal") == "SELL" and x.get("qualified") is True
+    ]
+    waits = [
+        x for x in results
+        if x.get("qualified") is not True
+    ]
+
+    phase_message = {
+        "PRE_MARKET": "Market has not opened yet.",
+        "MARKET_SETTLING": (
+            "Market settling: collecting opening data. "
+            "No new BUY/SELL suggestions before 09:45 IST."
+        ),
+        "NORMAL_SCAN": "Normal qualified scanning is active.",
+        "CONSERVATIVE_SCAN": (
+            "Late session: stronger qualification thresholds are active."
+        ),
+        "NO_NEW_ENTRIES": (
+            "No new suggestions after 15:15 IST. "
+            "Manage existing positions only."
+        ),
+        "END_OF_DAY": (
+            "Market closed. End-of-day observations are being saved "
+            "for future sessions."
+        ),
+        "MARKET_CLOSED": "Market is closed.",
+    }.get(session_phase, "")
 
     payload = {
-        "timestamp": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
-        "market_status": get_market_status(),
+        "timestamp": now_ist.isoformat(),
+        "market_status": market_status,
+        "session_phase": session_phase,
+        "phase_message": phase_message,
         "qualified_today": scanner_signal_count_today(),
         "max_qualified_per_day": MAX_QUALIFIED_SUGGESTIONS_PER_DAY,
         "interval": interval,
@@ -2262,6 +2857,9 @@ def intraday_scanner(
         "buy": buys,
         "sell": sells,
         "wait": waits,
+        "end_of_day_review": eod_review,
+        "historical_buy": _historical_setup_stats("BUY"),
+        "historical_sell": _historical_setup_stats("SELL"),
         "cached": False,
     }
 
@@ -2271,6 +2869,47 @@ def intraday_scanner(
     }
 
     return payload
+
+
+@app.post("/api/intraday/end-of-day-review")
+def intraday_end_of_day_review(
+    trade_date: Optional[str] = Query(None),
+    force: bool = Query(False),
+):
+    """Manually run/re-run the durable post-market observation pass."""
+    try:
+        return run_end_of_day_review(trade_date=trade_date, force=force)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.get("/api/intraday/end-of-day-review")
+def get_intraday_end_of_day_review(
+    trade_date: Optional[str] = Query(None),
+):
+    review = load_daily_review(trade_date)
+    if review is None:
+        return {
+            "status": "not_available",
+            "trade_date": trade_date,
+            "review": None,
+        }
+    return {"status": "success", "review": review}
+
+
+@app.get("/api/intraday/learning-summary")
+def intraday_learning_summary():
+    """Historical observations available to the next trading session."""
+    return {
+        "buy": _historical_setup_stats("BUY"),
+        "sell": _historical_setup_stats("SELL"),
+        "minimum_sample": HISTORICAL_MIN_SAMPLE,
+        "minimum_success_rate": HISTORICAL_MIN_SUCCESS_RATE,
+        "policy": (
+            "Historical performance is used only after the minimum sample "
+            "is reached. Setup quality is not a probability of profit."
+        ),
+    }
 
 
 # ============================================================

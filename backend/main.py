@@ -54,6 +54,7 @@ app.add_middleware(
 
 APP_USERNAME = os.getenv("APP_USERNAME", "").strip()
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+AUTH_TOKEN_DAYS = int(os.getenv("AUTH_TOKEN_DAYS", "7"))
 
 
 class LoginRequest(BaseModel):
@@ -220,7 +221,8 @@ intraday_paper_positions = {}
 # It only resets balance/open positions/pending orders.
 # ============================================================
 
-TRADE_HISTORY_DB = Path(__file__).resolve().parent / "stock_analyser_history.db"
+TRADE_HISTORY_DB = Path(os.getenv("TRADE_HISTORY_DB_PATH", str(Path(__file__).resolve().parent / "stock_analyser_history.db")))
+TRADE_HISTORY_DB.parent.mkdir(parents=True, exist_ok=True)
 
 
 def init_trade_history_db():
@@ -308,6 +310,65 @@ def save_all_intraday_trade_history():
 
 
 intraday_paper_trades = load_intraday_trade_history()
+
+
+# Qualified scanner suggestions are stored in the same durable database.
+MAX_QUALIFIED_SUGGESTIONS_PER_DAY = 5
+QUALIFIED_MIN_SCORE = 7
+QUALIFIED_MIN_RISK_REWARD = 1.80
+QUALIFIED_MIN_VOLUME_RATIO = 1.00
+
+def init_scanner_signal_db():
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS scanner_signal_history (
+                id TEXT PRIMARY KEY, trade_date TEXT NOT NULL, timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL, side TEXT NOT NULL, signal_json TEXT NOT NULL
+            )
+        """)
+        connection.commit()
+
+def scanner_signal_count_today():
+    init_scanner_signal_db()
+    day = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        row = connection.execute("SELECT COUNT(*) FROM scanner_signal_history WHERE trade_date=?", (day,)).fetchone()
+    return int(row[0] if row else 0)
+
+def store_qualified_signal(result):
+    init_scanner_signal_db()
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    day = now.date().isoformat()
+    symbol = clean_symbol(result.get("symbol", ""))
+    side = str(result.get("signal", "")).upper()
+    signal_id = f"{day}:{symbol}:{side}"
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        before = connection.total_changes
+        connection.execute("INSERT OR IGNORE INTO scanner_signal_history (id,trade_date,timestamp,symbol,side,signal_json) VALUES (?,?,?,?,?,?)",
+            (signal_id, day, now.isoformat(), symbol, side, json.dumps(result, ensure_ascii=False, default=str)))
+        connection.commit()
+        inserted = connection.total_changes > before
+    return signal_id, inserted
+
+def is_qualified_setup(result):
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    signal = str(result.get("signal", "")).upper()
+    score = abs(safe_float(result.get("score")) or 0)
+    rr = safe_float(result.get("risk_reward")) or 0
+    volume = safe_float(result.get("volume_ratio")) or 0
+    checks = {
+        "after_0945": (now.hour * 60 + now.minute) >= (9 * 60 + 45),
+        "market_open": get_market_status() == "OPEN",
+        "buy_or_sell": signal in ("BUY", "SELL"),
+        "score": score >= QUALIFIED_MIN_SCORE,
+        "risk_reward": rr >= QUALIFIED_MIN_RISK_REWARD,
+        "volume": volume >= QUALIFIED_MIN_VOLUME_RATIO,
+        "margin": bool(result.get("margin_band_eligible")),
+    }
+    quality = round(sum(checks.values()) / len(checks) * 10, 1)
+    return all(checks.values()), quality, checks
+
+init_scanner_signal_db()
 
 # LIMIT orders that are waiting for the market price to reach
 # the requested BUY / SELL price.
@@ -2145,6 +2206,29 @@ def intraday_scanner(
         for future in as_completed(futures):
             results.append(future.result())
 
+    # Apply a strict qualification gate and cap NEW suggestions at five/day.
+    slots = max(0, MAX_QUALIFIED_SUGGESTIONS_PER_DAY - scanner_signal_count_today())
+    ranked = sorted(results, key=lambda r: (-abs(float(r.get("score") or 0)), -float(r.get("risk_reward") or 0)))
+    for result in ranked:
+        qualified, quality, checks = is_qualified_setup(result)
+        result["setup_quality"] = quality
+        result["qualification_checks"] = checks
+        result["qualified"] = False
+        if qualified:
+            day = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+            signal_id = f"{day}:{clean_symbol(result.get('symbol',''))}:{str(result.get('signal','')).upper()}"
+            with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+                exists = connection.execute("SELECT 1 FROM scanner_signal_history WHERE id=?", (signal_id,)).fetchone() is not None
+            if exists:
+                result["qualified"] = True
+                result["signal_id"] = signal_id
+            elif slots > 0:
+                saved_id, inserted = store_qualified_signal(result)
+                result["qualified"] = True
+                result["signal_id"] = saved_id
+                if inserted:
+                    slots -= 1
+
     signal_order = {
         "BUY": 0,
         "SELL": 1,
@@ -2168,6 +2252,8 @@ def intraday_scanner(
     payload = {
         "timestamp": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
         "market_status": get_market_status(),
+        "qualified_today": scanner_signal_count_today(),
+        "max_qualified_per_day": MAX_QUALIFIED_SUGGESTIONS_PER_DAY,
         "interval": interval,
         "count": len(results),
         "buy_count": len(buys),

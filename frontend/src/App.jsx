@@ -355,7 +355,7 @@ export default function App() {
   const [scannerFilter, setScannerFilter] = useState("ALL");
   const [tradeNotificationsEnabled, setTradeNotificationsEnabled] =
     useState(false);
-  const notifiedPerfectSignalsRef = React.useRef(new Set());
+  const notifiedQualifiedSignalsRef = React.useRef(new Set());
 
   // ==========================================================
   // PAPER TRADING STATE
@@ -526,7 +526,7 @@ export default function App() {
     if (permission === "granted") {
       setTradeNotificationsEnabled(true);
       new Notification("Stock Analyzer alerts enabled", {
-        body: "Alerts will appear when the scanner reports a BUY or SELL setup at 100% confidence.",
+        body: "Alerts will appear only when a BUY or SELL setup passes the strict qualification filters.",
       });
     } else {
       setTradeNotificationsEnabled(false);
@@ -534,65 +534,43 @@ export default function App() {
     }
   }
 
-  function notifyPerfectConfidenceTrades(results = []) {
+  function notifyQualifiedTrades(results = []) {
     if (
       !tradeNotificationsEnabled ||
       !("Notification" in window) ||
       Notification.permission !== "granted"
-    ) {
-      return;
-    }
+    ) return;
 
     results.forEach((stock) => {
-      const confidence = Number(stock?.confidence ?? 0);
       const signal = String(stock?.signal ?? "").toUpperCase();
       const stockSymbol = String(stock?.symbol ?? "").toUpperCase();
+      if (!stock?.qualified || !["BUY", "SELL"].includes(signal) || !stockSymbol) return;
 
-      if (
-        confidence !== 100 ||
-        !["BUY", "SELL"].includes(signal) ||
-        !stockSymbol
-      ) {
-        return;
-      }
-
-      const fingerprint = [
-        stockSymbol,
-        signal,
-        confidence,
-        stock?.entry_price ?? stock?.entry ?? "",
-        stock?.stop_loss ?? "",
-        stock?.target_1 ?? stock?.target1 ?? "",
+      const fingerprint = stock?.signal_id || [
+        stockSymbol, signal, stock?.entry_price ?? "", stock?.stop_loss ?? "", stock?.target_1 ?? ""
       ].join("|");
-
-      if (notifiedPerfectSignalsRef.current.has(fingerprint)) {
-        return;
-      }
-
-      notifiedPerfectSignalsRef.current.add(fingerprint);
+      if (notifiedQualifiedSignalsRef.current.has(fingerprint)) return;
+      notifiedQualifiedSignalsRef.current.add(fingerprint);
 
       const entry = Number(stock?.entry_price ?? stock?.entry);
       const stopLoss = Number(stock?.stop_loss);
       const target1 = Number(stock?.target_1 ?? stock?.target1);
+      const target2 = Number(stock?.target_2 ?? stock?.target2);
+      const quality = Number(stock?.setup_quality ?? 0);
+      const rr = Number(stock?.risk_reward ?? 0);
 
-      const details = [
-        `${stockSymbol}: ${signal}`,
-        "Scanner confidence 100%",
-      ];
-
+      const details = [`${stockSymbol}: ${signal}`, `Quality ${quality.toFixed(1)}/10`];
       if (Number.isFinite(entry)) details.push(`Entry ₹${entry.toFixed(2)}`);
       if (Number.isFinite(stopLoss)) details.push(`SL ₹${stopLoss.toFixed(2)}`);
       if (Number.isFinite(target1)) details.push(`T1 ₹${target1.toFixed(2)}`);
+      if (Number.isFinite(target2)) details.push(`T2 ₹${target2.toFixed(2)}`);
+      if (Number.isFinite(rr) && rr > 0) details.push(`R:R 1:${rr.toFixed(2)}`);
 
-      const notification = new Notification(
-        `100% confidence ${signal}: ${stockSymbol}`,
-        {
-          body: `${details.join(" • ")} • Review before trading.`,
-          requireInteraction: true,
-          tag: `perfect-trade-${stockSymbol}-${signal}`,
-        }
-      );
-
+      const notification = new Notification(`Qualified ${signal} setup: ${stockSymbol}`, {
+        body: `${details.join(" • ")} • Review before execution.`,
+        requireInteraction: true,
+        tag: `qualified-trade-${fingerprint}`,
+      });
       notification.onclick = () => {
         window.focus();
         openScannerStock(stockSymbol);
@@ -614,7 +592,7 @@ export default function App() {
 
       const scannerResults = data?.results || [];
       setScannerData(scannerResults);
-      notifyPerfectConfidenceTrades(scannerResults);
+      notifyQualifiedTrades(scannerResults);
       setScannerUpdatedAt(data?.timestamp || "");
       setScannerMarketStatus(data?.market_status || "—");
       setScannerError("");
@@ -2472,11 +2450,11 @@ export default function App() {
                   fontWeight: 800,
                   cursor: "pointer",
                 }}
-                title="100% is the scanner's model confidence, not a guarantee of profit."
+                title="Alerts are sent only for setups that pass the strict qualification filters."
               >
                 {tradeNotificationsEnabled
-                  ? "🔔 100% Alerts ON"
-                  : "🔕 Enable 100% Alerts"}
+                  ? "🔔 Qualified Alerts ON"
+                  : "🔕 Enable Qualified Alerts"}
               </button>
             </div>
 

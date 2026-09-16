@@ -1632,19 +1632,23 @@ export default function App() {
 
   const sentiment = analysis?.sentiment || "Neutral";
 
-  const filteredScannerData = scannerData.filter((item) => {
-    if (scannerFilter === "ALL") {
-      return item.signal === "BUY" || item.signal === "SELL";
-    }
+  // Show only setups that passed the backend qualification filters.
+  const qualifiedScannerData = scannerData.filter(
+    (item) =>
+      item?.qualified === true &&
+      (item?.signal === "BUY" || item?.signal === "SELL")
+  );
 
+  const filteredScannerData = qualifiedScannerData.filter((item) => {
+    if (scannerFilter === "ALL") return true;
     return item.signal === scannerFilter;
   });
 
-  const scannerBuyCount = scannerData.filter(
+  const scannerBuyCount = qualifiedScannerData.filter(
     (item) => item.signal === "BUY"
   ).length;
 
-  const scannerSellCount = scannerData.filter(
+  const scannerSellCount = qualifiedScannerData.filter(
     (item) => item.signal === "SELL"
   ).length;
 
@@ -2680,12 +2684,19 @@ export default function App() {
                         positive={target2 != null}
                       />
                       <Indicator
-                        label="Confidence"
+                        label="Setup Quality"
                         value={
-                          item.confidence != null
-                            ? `${formatNumber(item.confidence, 0)}%`
+                          item.setup_quality != null
+                            ? `${formatNumber(item.setup_quality, 1)} / 10`
                             : "—"
                         }
+                        positive={item.qualified === true}
+                      />
+                      <Indicator
+                        label="Qualification"
+                        value={item.qualified === true ? "QUALIFIED SETUP" : "NOT QUALIFIED"}
+                        positive={item.qualified === true}
+                        negative={item.qualified !== true}
                       />
                       <Indicator
                         label="Suggested Qty"
@@ -3456,32 +3467,6 @@ export default function App() {
                   }}
                 >
                   <div
-                    style={{
-                      color: "#64748b",
-                      fontSize: 13,
-                    }}
-                  >
-                    Confidence
-                  </div>
-
-                  <div
-                    style={{
-                      fontSize: 27,
-                      fontWeight: 800,
-                      marginTop: 5,
-                    }}
-                  >
-                    {intraday.confidence !== null &&
-                    intraday.confidence !== undefined
-                      ? `${formatNumber(
-                          intraday.confidence,
-                          0
-                        )}%`
-                      : "—"}
-                  </div>
-                </div>
-
-                <div
                   style={{
                     padding: 18,
                     borderRadius: 12,
@@ -3489,7 +3474,37 @@ export default function App() {
                     border: "1px solid #e2e8f0",
                   }}
                 >
+                  <div style={{ color: "#64748b", fontSize: 13 }}>
+                    Setup Quality
+                  </div>
                   <div
+                    style={{
+                      fontSize: 27,
+                      fontWeight: 800,
+                      marginTop: 5,
+                      color: intraday.qualified === true ? "#16a34a" : "#475569",
+                    }}
+                  >
+                    {intraday.setup_quality !== null &&
+                    intraday.setup_quality !== undefined
+                      ? `${formatNumber(intraday.setup_quality, 1)} / 10`
+                      : "Analysis only"}
+                  </div>
+                  <div
+                    style={{
+                      marginTop: 6,
+                      fontSize: 12,
+                      fontWeight: 700,
+                      color: intraday.qualified === true ? "#16a34a" : "#64748b",
+                    }}
+                  >
+                    {intraday.qualified === true
+                      ? "QUALIFIED SETUP"
+                      : "Qualification is determined by the Opportunity Scanner"}
+                  </div>
+                </div>
+
+                <div
                     style={{
                       color: "#64748b",
                       fontSize: 13,

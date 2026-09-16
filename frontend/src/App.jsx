@@ -352,6 +352,8 @@ export default function App() {
   const [scannerError, setScannerError] = useState("");
   const [scannerUpdatedAt, setScannerUpdatedAt] = useState("");
   const [scannerMarketStatus, setScannerMarketStatus] = useState("—");
+  const [scannerSessionPhase, setScannerSessionPhase] = useState("—");
+  const [scannerPhaseMessage, setScannerPhaseMessage] = useState("");
   const [scannerFilter, setScannerFilter] = useState("ALL");
   const [tradeNotificationsEnabled, setTradeNotificationsEnabled] =
     useState(false);
@@ -595,6 +597,8 @@ export default function App() {
       notifyQualifiedTrades(scannerResults);
       setScannerUpdatedAt(data?.timestamp || "");
       setScannerMarketStatus(data?.market_status || "—");
+      setScannerSessionPhase(data?.session_phase || "—");
+      setScannerPhaseMessage(data?.phase_message || "");
       setScannerError("");
     } catch (err) {
       console.error("Scanner loading error:", err);
@@ -2415,6 +2419,37 @@ export default function App() {
               <div
                 style={{
                   marginTop: 4,
+                  fontSize: 13,
+                  fontWeight: 800,
+                  color:
+                    scannerSessionPhase === "NORMAL_SCAN"
+                      ? "#16a34a"
+                      : scannerSessionPhase === "CONSERVATIVE_SCAN"
+                        ? "#d97706"
+                        : scannerSessionPhase === "MARKET_SETTLING"
+                          ? "#2563eb"
+                          : "#64748b",
+                }}
+              >
+                Today's Session: {String(scannerSessionPhase || "—").replaceAll("_", " ")}
+              </div>
+
+              {scannerPhaseMessage ? (
+                <div
+                  style={{
+                    marginTop: 4,
+                    color: "#475569",
+                    fontSize: 12,
+                    fontWeight: 600,
+                  }}
+                >
+                  {scannerPhaseMessage}
+                </div>
+              ) : null}
+
+              <div
+                style={{
+                  marginTop: 4,
                   color: "#64748b",
                   fontSize: 12,
                 }}
@@ -3520,8 +3555,23 @@ export default function App() {
                       marginTop: 7,
                     }}
                   >
-                    {intraday.market_status || "—"}
+                    {scannerSessionPhase && scannerSessionPhase !== "—"
+                      ? String(scannerSessionPhase).replaceAll("_", " ")
+                      : intraday.market_status || scannerMarketStatus || "—"}
                   </div>
+
+                  {scannerPhaseMessage ? (
+                    <div
+                      style={{
+                        marginTop: 6,
+                        color: "#64748b",
+                        fontSize: 12,
+                        lineHeight: 1.45,
+                      }}
+                    >
+                      {scannerPhaseMessage}
+                    </div>
+                  ) : null}
                 </div>
 
                 <div

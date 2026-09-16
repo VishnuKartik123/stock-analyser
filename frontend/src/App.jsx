@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import StockChart from "./StockChart";
 import IntradayChart from "./IntradayChart";
 
@@ -397,6 +397,7 @@ export default function App() {
   const [dayTradeAccount, setDayTradeAccount] = useState(null);
   const [dayTradePositions, setDayTradePositions] = useState([]);
   const [dayTradeTrades, setDayTradeTrades] = useState([]);
+  const intradayHistoryRef = useRef(null);
   const [dayTradePendingOrders, setDayTradePendingOrders] = useState([]);
   const [dayTradeMessage, setDayTradeMessage] = useState("");
   const [dayTradeTargetInputs, setDayTradeTargetInputs] = useState({});
@@ -1076,7 +1077,23 @@ export default function App() {
 
       setDayTradeAccount(accountData);
       setDayTradePositions(positionsData?.positions || positionsData || []);
-      setDayTradeTrades(tradesData?.trades || tradesData || []);
+
+      // /api/intraday-paper/trades normally returns a raw array.
+      // Keep this tolerant of either a raw array or { trades: [...] },
+      // then always show newest executions first.
+      const normalizedTradeHistory = Array.isArray(tradesData)
+        ? tradesData
+        : Array.isArray(tradesData?.trades)
+        ? tradesData.trades
+        : [];
+
+      const sortedTradeHistory = [...normalizedTradeHistory].sort((a, b) => {
+        const aTime = new Date(a?.timestamp || 0).getTime();
+        const bTime = new Date(b?.timestamp || 0).getTime();
+        return bTime - aTime;
+      });
+
+      setDayTradeTrades(sortedTradeHistory);
       setDayTradePendingOrders(
         pendingData?.orders || pendingData || []
       );
@@ -1221,6 +1238,15 @@ export default function App() {
       }
 
       setDayTradeMessage(finalMessage);
+
+      // MARKET orders return the executed trade immediately. Put it in the
+      // history at once, then refresh from SQLite so the UI and DB agree.
+      if (data?.trade?.id) {
+        setDayTradeTrades((previousTrades) => [
+          data.trade,
+          ...previousTrades.filter((trade) => trade?.id !== data.trade.id),
+        ]);
+      }
 
       await Promise.all([
         loadDayTradeData(),
@@ -6267,10 +6293,52 @@ export default function App() {
             </div>
           )}
 
-          {/* Intraday trade history */}
+          {/* Intraday trade history - loaded from SQLite backend */}
+
+          <div
+            ref={intradayHistoryRef}
+            style={{
+              marginTop: 28,
+              padding: 18,
+              border: "2px solid #0f172a",
+              borderRadius: 12,
+              background: "#f8fafc",
+            }}
+          >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+              fontWeight: 900,
+              color: "#0f172a",
+              marginBottom: 12,
+              fontSize: 18,
+            }}
+          >
+            <span>TRADE HISTORY ({dayTradeTrades.length})</span>
+            <button
+              type="button"
+              onClick={() => loadDayTradeData()}
+              style={{
+                padding: "8px 12px",
+                border: "1px solid #94a3b8",
+                borderRadius: 8,
+                background: "#ffffff",
+                color: "#0f172a",
+                fontWeight: 800,
+                cursor: "pointer",
+              }}
+            >
+              Refresh History
+            </button>
+          </div>
 
           <div
             style={{
+              display: "none",
               marginTop: 20,
               fontWeight: 900,
               color: "#0f172a",
@@ -6389,6 +6457,7 @@ export default function App() {
               </table>
             </div>
           )}
+          </div>
 
           <div
             style={{
@@ -6433,6 +6502,34 @@ export default function App() {
           verify live market conditions before making financial
           decisions.
         </div>
+      {analysisCategory === "INTRADAY" && (
+        <button
+          type="button"
+          onClick={() =>
+            intradayHistoryRef.current?.scrollIntoView({
+              behavior: "smooth",
+              block: "start",
+            })
+          }
+          style={{
+            position: "fixed",
+            right: 22,
+            bottom: 22,
+            zIndex: 1000,
+            padding: "12px 16px",
+            border: "none",
+            borderRadius: 999,
+            background: "#0f172a",
+            color: "#ffffff",
+            fontWeight: 900,
+            cursor: "pointer",
+            boxShadow: "0 8px 24px rgba(15, 23, 42, 0.25)",
+          }}
+        >
+          Trade History ({dayTradeTrades.length})
+        </button>
+      )}
+
       </main>
     </div>
   );

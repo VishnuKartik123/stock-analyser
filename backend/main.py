@@ -54,7 +54,6 @@ app.add_middleware(
 
 APP_USERNAME = os.getenv("APP_USERNAME", "").strip()
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
-AUTH_TOKEN_DAYS = 30
 
 
 class LoginRequest(BaseModel):
@@ -3233,6 +3232,11 @@ def get_intraday_paper_positions():
 
 @app.get("/api/intraday-paper/trades")
 def get_intraday_paper_trades():
+    # Read directly from SQLite for every history request. This guarantees
+    # that the website shows the persisted executions, even if the in-memory
+    # list was stale or the backend process was restarted.
+    global intraday_paper_trades
+    intraday_paper_trades = load_intraday_trade_history()
     return intraday_paper_trades
 
 

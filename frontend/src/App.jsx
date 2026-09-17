@@ -7,7 +7,7 @@ import IntradayChart from "./IntradayChart";
 // ============================================================
 
 const BACKEND =
-  import.meta.env.VITE_BACKEND_URL || "https://stock-analyser-gyrt.onrender.com";
+  import.meta.env.VITE_BACKEND_URL || "https://stock-analyser-z5sc.onrender.com";
 
 const PAPER_STOCK_OPTIONS = [
   ["RELIANCE", "Reliance Industries"],
@@ -356,7 +356,10 @@ export default function App() {
   const [scannerPhaseMessage, setScannerPhaseMessage] = useState("");
   const [scannerFilter, setScannerFilter] = useState("ALL");
   const [tradeNotificationsEnabled, setTradeNotificationsEnabled] =
-    useState(false);
+    useState(() => {
+      if (!("Notification" in window)) return false;
+      return Notification.permission === "granted";
+    });
   const notifiedQualifiedSignalsRef = React.useRef(new Set());
 
   // ==========================================================
@@ -517,6 +520,18 @@ export default function App() {
   // LOAD INTRADAY OPPORTUNITY SCANNER
   // ==========================================================
 
+  useEffect(() => {
+    if (!("Notification" in window)) return;
+
+    if (Notification.permission === "granted") {
+      setTradeNotificationsEnabled(true);
+      window.localStorage.setItem("stock_analyser_qualified_alerts", "enabled");
+    } else if (Notification.permission === "denied") {
+      setTradeNotificationsEnabled(false);
+      window.localStorage.removeItem("stock_analyser_qualified_alerts");
+    }
+  }, []);
+
   async function enableTradeNotifications() {
     if (!("Notification" in window)) {
       alert("This browser does not support desktop notifications.");
@@ -527,11 +542,13 @@ export default function App() {
 
     if (permission === "granted") {
       setTradeNotificationsEnabled(true);
+      window.localStorage.setItem("stock_analyser_qualified_alerts", "enabled");
       new Notification("Stock Analyzer alerts enabled", {
         body: "Alerts will appear only when a BUY or SELL setup passes the strict qualification filters.",
       });
     } else {
       setTradeNotificationsEnabled(false);
+      window.localStorage.removeItem("stock_analyser_qualified_alerts");
       alert("Please allow notifications for this site in your browser settings.");
     }
   }

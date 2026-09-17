@@ -20,6 +20,8 @@ import math
 import traceback
 import time
 import uuid
+import gc
+import threading
 from typing import Optional
 
 
@@ -755,6 +757,7 @@ def run_end_of_day_review(trade_date=None, force=False):
         if not symbol:
             continue
 
+        df = None
         try:
             df = get_history(symbol, "5d", "5m")
             outcome = _candidate_outcome_from_intraday_data(candidate, df)
@@ -764,6 +767,9 @@ def run_end_of_day_review(trade_date=None, force=False):
                 "result": "DATA_ERROR",
                 "error": str(error),
             }
+        finally:
+            if df is not None:
+                del df
 
         if not outcome:
             continue
@@ -941,10 +947,14 @@ def rebuild_paper_state(trades):
 # Intraday scanner cache. This prevents every public visitor from
 # triggering 50+ Yahoo Finance downloads at the same time.
 SCANNER_CACHE_TTL_SECONDS = 60
-scanner_cache = {
-    "timestamp": 0.0,
-    "payload": None,
-}
+# Keep scanner concurrency deliberately small on memory-constrained hosts
+# such as Render's 512 MB instances. Override with SCANNER_MAX_WORKERS if needed.
+SCANNER_MAX_WORKERS = max(1, min(2, int(os.getenv("SCANNER_MAX_WORKERS", "2"))))
+scanner_cache = {}
+
+# Only one expensive full-market scan may download/process data at a time.
+# Concurrent HTTP requests will wait here and then reuse the fresh cache.
+scanner_execution_lock = threading.Lock()
 
 
 class OrderRequest(BaseModel):
@@ -2682,6 +2692,7 @@ def intraday_scanner(
 
     def scan_one(item):
         stock_symbol, stock_name = item
+        df = None
 
         try:
             df = get_history(
@@ -2727,19 +2738,46 @@ def intraday_scanner(
                 "session_phase": session_phase,
                 "error": str(error),
             }
+        finally:
+            # pandas/yfinance frames can be several MB each. Drop the worker's
+            # last reference as soon as that symbol has been converted to a result.
+            if df is not None:
+                del df
 
     results = []
 
     # The scanner may still collect observations while the market is settling,
     # but qualification is blocked by is_qualified_setup().
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = [
-            executor.submit(scan_one, stock)
-            for stock in COMMON_STOCKS
-        ]
+    # Serialize full scans so multiple frontend requests cannot each launch
+    # their own Yahoo/pandas workload at the same time on a 512 MB service.
+    with scanner_execution_lock:
+        # A different request may have completed a scan while this request
+        # waited for the lock. Reuse that newly-created payload when possible.
+        cached_after_wait = scanner_cache.get(cache_key)
+        lock_now_ts = time.time()
+        if (
+            not force
+            and cached_after_wait
+            and lock_now_ts - cached_after_wait["timestamp"] < SCANNER_CACHE_TTL_SECONDS
+        ):
+            payload = dict(cached_after_wait["payload"])
+            payload["cached"] = True
+            payload["session_phase"] = session_phase
+            payload["end_of_day_review"] = eod_review
+            return payload
 
-        for future in as_completed(futures):
-            results.append(future.result())
+        with ThreadPoolExecutor(max_workers=SCANNER_MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(scan_one, stock)
+                for stock in COMMON_STOCKS
+            ]
+
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        # Release executor/future references promptly after a large scan.
+        futures.clear()
+        gc.collect()
 
     # Rank first, then apply the strict qualification gate. New suggestions
     # are capped at five for the entire trading day.

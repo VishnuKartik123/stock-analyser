@@ -4180,6 +4180,185 @@ def get_intraday_paper_positions():
 
 
 # ============================================================
+# NIGHTLY LEARNING EXPORT
+# ============================================================
+
+@app.get("/api/learning/export")
+def export_learning_data(trade_date: Optional[str] = Query(default=None)):
+    """
+    Export Render's temporary learning data so it can be copied into the
+    permanent local SQLite database each night.
+
+    This endpoint remains protected by the normal /api authentication
+    middleware. If trade_date is supplied (YYYY-MM-DD), only that session is
+    returned. If omitted, all currently available Render records are returned.
+    """
+    init_trade_history_db()
+    init_scanner_signal_db()
+
+    result = {
+        "exported_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+        "trade_date": trade_date,
+        "trades": [],
+        "signals": [],
+        "candidates": [],
+        "daily_reviews": [],
+    }
+
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        connection.row_factory = sqlite3.Row
+
+        # Executed trades do not have a separate trade_date column, so filter
+        # on the ISO timestamp prefix when a date is requested.
+        if trade_date:
+            trade_rows = connection.execute(
+                """
+                SELECT id,timestamp,trade_json
+                FROM intraday_trade_history
+                WHERE timestamp LIKE ?
+                ORDER BY timestamp ASC
+                """,
+                (f"{trade_date}%",),
+            ).fetchall()
+        else:
+            trade_rows = connection.execute(
+                """
+                SELECT id,timestamp,trade_json
+                FROM intraday_trade_history
+                ORDER BY timestamp ASC
+                """
+            ).fetchall()
+
+        for row in trade_rows:
+            try:
+                trade = json.loads(row["trade_json"])
+            except Exception:
+                trade = {}
+            result["trades"].append({
+                "id": row["id"],
+                "timestamp": row["timestamp"],
+                "data": trade if isinstance(trade, dict) else {},
+            })
+
+        if trade_date:
+            signal_rows = connection.execute(
+                """
+                SELECT id,trade_date,timestamp,symbol,side,signal_json
+                FROM scanner_signal_history
+                WHERE trade_date=?
+                ORDER BY timestamp ASC
+                """,
+                (trade_date,),
+            ).fetchall()
+        else:
+            signal_rows = connection.execute(
+                """
+                SELECT id,trade_date,timestamp,symbol,side,signal_json
+                FROM scanner_signal_history
+                ORDER BY timestamp ASC
+                """
+            ).fetchall()
+
+        for row in signal_rows:
+            try:
+                payload = json.loads(row["signal_json"])
+            except Exception:
+                payload = {}
+            result["signals"].append({
+                "id": row["id"],
+                "trade_date": row["trade_date"],
+                "timestamp": row["timestamp"],
+                "symbol": row["symbol"],
+                "side": row["side"],
+                "data": payload if isinstance(payload, dict) else {},
+            })
+
+        if trade_date:
+            candidate_rows = connection.execute(
+                """
+                SELECT id,trade_date,timestamp,symbol,side,qualified,resolved,
+                       candidate_json,outcome_json
+                FROM scanner_candidate_history
+                WHERE trade_date=?
+                ORDER BY timestamp ASC
+                """,
+                (trade_date,),
+            ).fetchall()
+        else:
+            candidate_rows = connection.execute(
+                """
+                SELECT id,trade_date,timestamp,symbol,side,qualified,resolved,
+                       candidate_json,outcome_json
+                FROM scanner_candidate_history
+                ORDER BY timestamp ASC
+                """
+            ).fetchall()
+
+        for row in candidate_rows:
+            try:
+                candidate = json.loads(row["candidate_json"])
+            except Exception:
+                candidate = {}
+            try:
+                outcome = (
+                    json.loads(row["outcome_json"])
+                    if row["outcome_json"] is not None
+                    else None
+                )
+            except Exception:
+                outcome = None
+
+            result["candidates"].append({
+                "id": row["id"],
+                "trade_date": row["trade_date"],
+                "timestamp": row["timestamp"],
+                "symbol": row["symbol"],
+                "side": row["side"],
+                "qualified": int(row["qualified"] or 0),
+                "resolved": int(row["resolved"] or 0),
+                "candidate": candidate if isinstance(candidate, dict) else {},
+                "outcome": outcome if isinstance(outcome, dict) else None,
+            })
+
+        if trade_date:
+            review_rows = connection.execute(
+                """
+                SELECT trade_date,created_at,review_json
+                FROM scanner_daily_review
+                WHERE trade_date=?
+                """,
+                (trade_date,),
+            ).fetchall()
+        else:
+            review_rows = connection.execute(
+                """
+                SELECT trade_date,created_at,review_json
+                FROM scanner_daily_review
+                ORDER BY trade_date ASC
+                """
+            ).fetchall()
+
+        for row in review_rows:
+            try:
+                review = json.loads(row["review_json"])
+            except Exception:
+                review = {}
+            result["daily_reviews"].append({
+                "trade_date": row["trade_date"],
+                "created_at": row["created_at"],
+                "data": review if isinstance(review, dict) else {},
+            })
+
+    result["counts"] = {
+        "trades": len(result["trades"]),
+        "signals": len(result["signals"]),
+        "candidates": len(result["candidates"]),
+        "daily_reviews": len(result["daily_reviews"]),
+    }
+    return result
+
+
+# ============================================================
 # INTRADAY PAPER TRADES
 # ============================================================
 

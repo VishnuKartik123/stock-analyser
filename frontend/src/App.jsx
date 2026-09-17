@@ -362,10 +362,7 @@ export default function App() {
   const [tradeNotificationsEnabled, setTradeNotificationsEnabled] =
     useState(() => {
       if (!("Notification" in window)) return false;
-      const saved = window.localStorage.getItem(
-        "stock_analyser_qualified_alerts"
-      );
-      return saved !== "disabled";
+      return Notification.permission === "granted";
     });
   const notifiedQualifiedSignalsRef = React.useRef(new Set());
 
@@ -530,15 +527,11 @@ export default function App() {
   useEffect(() => {
     if (!("Notification" in window)) return;
 
-    const saved = window.localStorage.getItem(
-      "stock_analyser_qualified_alerts"
-    );
-
-    if (saved === null) {
-      window.localStorage.setItem("stock_analyser_qualified_alerts", "enabled");
+    // The app never turns Qualified Alerts off after browser permission is granted.
+    if (Notification.permission === "granted") {
       setTradeNotificationsEnabled(true);
     } else {
-      setTradeNotificationsEnabled(saved !== "disabled");
+      setTradeNotificationsEnabled(false);
     }
   }, []);
 
@@ -548,18 +541,31 @@ export default function App() {
       return;
     }
 
+    if (Notification.permission === "granted") {
+      setTradeNotificationsEnabled(true);
+      return;
+    }
+
+    if (Notification.permission === "denied") {
+      setTradeNotificationsEnabled(false);
+      alert(
+        "Notifications are blocked for this site. Please allow notifications in your browser site settings."
+      );
+      return;
+    }
+
     const permission = await Notification.requestPermission();
 
     if (permission === "granted") {
       setTradeNotificationsEnabled(true);
-      window.localStorage.setItem("stock_analyser_qualified_alerts", "enabled");
       new Notification("Stock Analyzer alerts enabled", {
-        body: "Alerts will appear only when a BUY or SELL setup passes the strict qualification filters.",
+        body: "Qualified BUY/SELL alerts are permanently enabled for this site.",
       });
     } else {
-      setTradeNotificationsEnabled(true);
-      window.localStorage.setItem("stock_analyser_qualified_alerts", "enabled");
-      alert("Qualified Alerts remain ON. Please allow notifications for this site in your browser settings to receive desktop pop-ups.");
+      setTradeNotificationsEnabled(false);
+      alert(
+        "Please allow notifications for this site to receive Qualified BUY/SELL alerts."
+      );
     }
   }
 
@@ -1911,23 +1917,6 @@ export default function App() {
   // RENDER
   // ==========================================================
 
-  useEffect(() => {
-    if (analysisCategory !== "INTRADAY") {
-      return undefined;
-    }
-
-    const scannerAlertTimer = window.setInterval(() => {
-      loadScanner(false);
-    }, 60000);
-
-    return () => {
-      window.clearInterval(scannerAlertTimer);
-    };
-  }, [
-    analysisCategory,
-    intradayInterval,
-    tradeNotificationsEnabled,
-  ]);
 
 
   if (authChecking) {
@@ -2502,17 +2491,7 @@ export default function App() {
             >
               <button
                 type="button"
-                onClick={
-                  tradeNotificationsEnabled
-                    ? () => {
-                        setTradeNotificationsEnabled(false);
-                        window.localStorage.setItem(
-                          "stock_analyser_qualified_alerts",
-                          "disabled"
-                        );
-                      }
-                    : enableTradeNotifications
-                }
+                onClick={enableTradeNotifications}
                 style={{
                   padding: "10px 13px",
                   borderRadius: 9,

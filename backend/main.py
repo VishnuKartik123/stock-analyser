@@ -234,20 +234,38 @@ intraday_paper_positions = {}
 TRADE_HISTORY_DB = Path(os.getenv("TRADE_HISTORY_DB_PATH", str(Path(__file__).resolve().parent / "stock_analyser_history.db")))
 TRADE_HISTORY_DB.parent.mkdir(parents=True, exist_ok=True)
 
+# Serialize trade-history writes inside this backend process. This prevents
+# simultaneous order/trigger requests from competing for the SQLite file.
+TRADE_HISTORY_WRITE_LOCK = threading.RLock()
+
+
+def _trade_history_connection():
+    """Open SQLite with durability/concurrency settings for trade execution history."""
+    connection = sqlite3.connect(
+        TRADE_HISTORY_DB,
+        timeout=30.0,
+        isolation_level=None,
+    )
+    connection.execute("PRAGMA busy_timeout=30000")
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    return connection
+
 
 def init_trade_history_db():
-    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS intraday_trade_history (
-                id TEXT PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                trade_json TEXT NOT NULL
+    with TRADE_HISTORY_WRITE_LOCK:
+        with _trade_history_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intraday_trade_history (
+                    id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    trade_json TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        connection.commit()
-
+            connection.execute("COMMIT")
 
 def load_intraday_trade_history():
     init_trade_history_db()
@@ -275,44 +293,89 @@ def load_intraday_trade_history():
 
 
 def save_intraday_trade(trade):
+    """
+    Durably save one executed intraday trade before the order endpoint reports
+    success. Raises on persistence failure so an execution is never silently
+    acknowledged without a durable history record.
+    """
     if not isinstance(trade, dict):
-        return
+        raise ValueError("Executed trade must be a dictionary")
 
     trade_id = str(trade.get("id") or uuid.uuid4().hex)
     trade["id"] = trade_id
 
     timestamp = str(
-        trade.get("timestamp") or datetime.now().isoformat()
+        trade.get("timestamp")
+        or datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
     )
     trade["timestamp"] = timestamp
 
+    payload = json.dumps(
+        trade,
+        ensure_ascii=False,
+        default=str,
+    )
+
     init_trade_history_db()
 
-    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
-        connection.execute(
-            """
-            INSERT INTO intraday_trade_history (
-                id,
-                timestamp,
-                trade_json
-            )
-            VALUES (?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                timestamp = excluded.timestamp,
-                trade_json = excluded.trade_json
-            """,
-            (
-                trade_id,
-                timestamp,
-                json.dumps(
-                    trade,
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            ),
-        )
-        connection.commit()
+    last_error = None
 
+    # Retry brief SQLite lock/contention failures. The endpoint does not return
+    # success unless the row has been committed and verified.
+    for attempt in range(5):
+        try:
+            with TRADE_HISTORY_WRITE_LOCK:
+                with _trade_history_connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        """
+                        INSERT INTO intraday_trade_history (
+                            id,
+                            timestamp,
+                            trade_json
+                        )
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            timestamp = excluded.timestamp,
+                            trade_json = excluded.trade_json
+                        """,
+                        (trade_id, timestamp, payload),
+                    )
+                    connection.execute("COMMIT")
+
+                    row = connection.execute(
+                        """
+                        SELECT trade_json
+                        FROM intraday_trade_history
+                        WHERE id=?
+                        """,
+                        (trade_id,),
+                    ).fetchone()
+
+                    if not row:
+                        raise RuntimeError(
+                            f"Trade {trade_id} was not found after SQLite commit"
+                        )
+
+                    saved = json.loads(row[0])
+                    if str(saved.get("id")) != trade_id:
+                        raise RuntimeError(
+                            f"Trade {trade_id} failed post-commit verification"
+                        )
+
+            return trade
+
+        except sqlite3.OperationalError as error:
+            last_error = error
+            if attempt >= 4:
+                break
+            time.sleep(0.10 * (attempt + 1))
+        except Exception:
+            raise
+
+    raise RuntimeError(
+        f"Unable to durably save executed trade {trade_id}: {last_error}"
+    )
 
 def save_all_intraday_trade_history():
     for trade in intraday_paper_trades:
@@ -4449,11 +4512,22 @@ def place_intraday_paper_order(order: OrderRequest):
         "stop_loss": order.stop_loss,
     }
 
-    intraday_paper_trades.insert(0, trade)
+    # DURABILITY RULE:
+    # Commit and verify the execution in SQLite BEFORE reporting success or
+    # adding it to the in-memory history. If persistence fails, this request
+    # fails loudly instead of silently losing the execution record.
+    try:
+        save_intraday_trade(trade)
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Trade execution could not be durably saved. "
+                f"The order was not acknowledged as successful: {error}"
+            ),
+        )
 
-    # Persist immediately. The trade remains in history even if the
-    # backend is restarted or --reload reloads main.py.
-    save_intraday_trade(trade)
+    intraday_paper_trades.insert(0, trade)
 
     return {
         "status": "success",

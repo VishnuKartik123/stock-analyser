@@ -330,19 +330,19 @@ intraday_paper_trades = load_intraday_trade_history()
 # are used only after a minimum sample exists.
 # ============================================================
 
-MAX_QUALIFIED_SUGGESTIONS_PER_DAY = 5
-QUALIFIED_MIN_SCORE = 7
-QUALIFIED_MIN_RISK_REWARD = 1.80
-QUALIFIED_MIN_VOLUME_RATIO = 1.00
+MAX_QUALIFIED_SUGGESTIONS_PER_DAY = 3
+QUALIFIED_MIN_SCORE = 6
+QUALIFIED_MIN_RISK_REWARD = 1.50
+QUALIFIED_MIN_VOLUME_RATIO = 0.80
 
 LATE_SESSION_START_MINUTES = 14 * 60 + 45
 NEW_ENTRY_CUTOFF_MINUTES = 15 * 60 + 15
 MARKET_SETTLED_MINUTES = 9 * 60 + 45
 
 # Late-session entries must be stronger because less trading time remains.
-LATE_QUALIFIED_MIN_SCORE = 8
-LATE_QUALIFIED_MIN_RISK_REWARD = 2.00
-LATE_QUALIFIED_MIN_VOLUME_RATIO = 1.20
+LATE_QUALIFIED_MIN_SCORE = 7
+LATE_QUALIFIED_MIN_RISK_REWARD = 1.80
+LATE_QUALIFIED_MIN_VOLUME_RATIO = 1.00
 
 # Do not use historical performance as a gate until enough resolved examples
 # exist. This avoids overfitting a handful of trades.
@@ -535,6 +535,20 @@ def _historical_setup_stats(side):
 
 
 def is_qualified_setup(result):
+    """
+    Two-level intraday qualification.
+
+    CONFIRMED:
+        Passes every normal strategy filter.
+
+    EXECUTABLE:
+        Controlled fallback used for otherwise strong BUY/SELL setups when
+        the strict gate produces too few opportunities. It never accepts
+        WAIT/NO TRADE signals and still requires market/session, score,
+        risk/reward, margin, valid trade levels, and historical filter.
+
+    setup_quality is descriptive only; it is not a probability of profit.
+    """
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     minutes = now.hour * 60 + now.minute
     signal = str(result.get("signal", "")).upper()
@@ -558,12 +572,33 @@ def is_qualified_setup(result):
         else QUALIFIED_MIN_VOLUME_RATIO
     )
 
+    # Controlled fallback thresholds. Late-session fallback remains stricter.
+    executable_min_score = 7 if late_session else 6
+    executable_min_rr = 1.60 if late_session else 1.50
+    executable_min_volume = 0.85 if late_session else 0.70
+
     historical = _historical_setup_stats(signal)
     historical_ok = (
         not historical["sufficient_sample"]
         or (
             historical["success_rate"] is not None
             and historical["success_rate"] >= HISTORICAL_MIN_SUCCESS_RATE
+        )
+    )
+
+    entry = safe_float(result.get("entry_price"))
+    stop = safe_float(result.get("stop_loss"))
+    target1 = safe_float(result.get("target_1") or result.get("target1"))
+    target2 = safe_float(result.get("target_2") or result.get("target2"))
+
+    valid_levels = (
+        entry is not None
+        and stop is not None
+        and target1 is not None
+        and target2 is not None
+        and (
+            (signal == "BUY" and stop < entry < target1 <= target2)
+            or (signal == "SELL" and stop > entry > target1 >= target2)
         )
     )
 
@@ -576,11 +611,26 @@ def is_qualified_setup(result):
         "risk_reward": rr >= min_rr,
         "volume": volume >= min_volume,
         "margin": bool(result.get("margin_band_eligible")),
+        "valid_trade_levels": valid_levels,
         "historical_filter": historical_ok,
     }
 
-    # Setup quality describes how many qualification checks passed. It is not
-    # a probability of profit.
+    executable_checks = {
+        "market_settled": checks["market_settled"],
+        "market_open": checks["market_open"],
+        "new_entries_allowed": checks["new_entries_allowed"],
+        "buy_or_sell": checks["buy_or_sell"],
+        "score": score >= executable_min_score,
+        "risk_reward": rr >= executable_min_rr,
+        "volume": volume >= executable_min_volume,
+        "margin": checks["margin"],
+        "valid_trade_levels": valid_levels,
+        "historical_filter": historical_ok,
+    }
+
+    strict_qualified = all(checks.values())
+    executable = all(executable_checks.values())
+
     quality = round(sum(bool(x) for x in checks.values()) / len(checks) * 10, 1)
 
     result["session_phase"] = (
@@ -598,9 +648,16 @@ def is_qualified_setup(result):
         "min_risk_reward": min_rr,
         "min_volume_ratio": min_volume,
     }
+    result["executable_thresholds"] = {
+        "min_score": executable_min_score,
+        "min_risk_reward": executable_min_rr,
+        "min_volume_ratio": executable_min_volume,
+    }
+    result["strict_qualified"] = strict_qualified
+    result["executable"] = executable
+    result["executable_checks"] = executable_checks
 
-    return all(checks.values()), quality, checks
-
+    return strict_qualified, quality, checks
 
 def _candidate_outcome_from_intraday_data(candidate, df):
     """Evaluate which level was reached first after a candidate was captured."""
@@ -1870,11 +1927,11 @@ def generate_intraday_signal(
     # DETERMINE SIGNAL
     # ========================================================
 
-    if score >= 7:
+    if score >= 6:
 
         signal = "BUY"
 
-    elif score <= -7:
+    elif score <= -6:
 
         signal = "SELL"
 
@@ -2063,9 +2120,9 @@ def generate_intraday_signal(
     # The simulator uses a 20% intraday margin estimate (= up to 5x
     # exposure). Suggestions are therefore sized so estimated margin
     # targets approximately ₹10,000 per suggested trade whenever the stock price permits.
-    min_estimated_margin = 10000.0
+    min_estimated_margin = 8000.0
     max_estimated_margin = 10000.0
-    target_estimated_margin = 10000.0
+    target_estimated_margin = 9000.0
 
     quantity = 0
     risk_based_quantity = 0
@@ -2779,8 +2836,9 @@ def intraday_scanner(
         futures.clear()
         gc.collect()
 
-    # Rank first, then apply the strict qualification gate. New suggestions
-    # are capped at five for the entire trading day.
+    # Rank candidates first. Strictly qualified setups get first priority.
+    # If fewer than two setups have qualified today, the best controlled
+    # EXECUTABLE fallback candidates may fill the remaining slots.
     slots = max(
         0,
         MAX_QUALIFIED_SUGGESTIONS_PER_DAY - scanner_signal_count_today()
@@ -2791,16 +2849,73 @@ def intraday_scanner(
         key=lambda r: (
             -abs(float(r.get("score") or 0)),
             -float(r.get("risk_reward") or 0),
+            -float(r.get("volume_ratio") or 0),
         ),
     )
 
+    # First calculate qualification state for every result.
     for result in ranked:
         qualified, quality, checks = is_qualified_setup(result)
         result["setup_quality"] = quality
         result["qualification_checks"] = checks
         result["qualified"] = False
+        result["qualification_level"] = "NONE"
 
         if qualified:
+            result["qualification_level"] = "CONFIRMED"
+
+    # Strict setups always have first priority.
+    for result in ranked:
+        if result.get("qualification_level") != "CONFIRMED":
+            continue
+
+        day = now_ist.date().isoformat()
+        signal_id = (
+            f"{day}:"
+            f"{clean_symbol(result.get('symbol',''))}:"
+            f"{str(result.get('signal','')).upper()}"
+        )
+
+        with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM scanner_signal_history WHERE id=?",
+                (signal_id,),
+            ).fetchone() is not None
+
+        if exists:
+            result["qualified"] = True
+            result["signal_id"] = signal_id
+        elif slots > 0:
+            saved_id, inserted = store_qualified_signal(result)
+            result["qualified"] = True
+            result["signal_id"] = saved_id
+            if inserted:
+                slots -= 1
+
+    # Controlled fallback:
+    # Try to provide at least two valid setups for the day, but never manufacture
+    # a WAIT/NO TRADE signal and never exceed the daily maximum.
+    qualified_today_now = scanner_signal_count_today()
+    fallback_needed = max(0, min(2 - qualified_today_now, slots))
+
+    if fallback_needed > 0:
+        fallback_candidates = [
+            r for r in ranked
+            if r.get("qualified") is not True
+            and r.get("executable") is True
+            and str(r.get("signal", "")).upper() in ("BUY", "SELL")
+        ]
+
+        fallback_candidates.sort(
+            key=lambda r: (
+                -float(r.get("setup_quality") or 0),
+                -abs(float(r.get("score") or 0)),
+                -float(r.get("risk_reward") or 0),
+                -float(r.get("volume_ratio") or 0),
+            )
+        )
+
+        for result in fallback_candidates[:fallback_needed]:
             day = now_ist.date().isoformat()
             signal_id = (
                 f"{day}:"
@@ -2816,16 +2931,20 @@ def intraday_scanner(
 
             if exists:
                 result["qualified"] = True
+                result["qualification_level"] = "EXECUTABLE"
                 result["signal_id"] = signal_id
             elif slots > 0:
-                saved_id, inserted = store_qualified_signal(result)
+                # Mark the fallback level before storing so history records
+                # exactly why this candidate was surfaced.
                 result["qualified"] = True
+                result["qualification_level"] = "EXECUTABLE"
+                saved_id, inserted = store_qualified_signal(result)
                 result["signal_id"] = saved_id
                 if inserted:
                     slots -= 1
 
-        # Persist BUY/SELL candidates whether they passed or failed the gate.
-        # This gives the next-day historical filter a less biased dataset.
+    # Persist BUY/SELL candidates whether they passed or failed.
+    for result in ranked:
         candidate_id = store_scanner_candidate(result)
         if candidate_id:
             result["candidate_id"] = candidate_id

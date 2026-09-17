@@ -125,7 +125,15 @@ async def require_authentication(request: Request, call_next):
     path = request.url.path
     public_paths = {"/", "/api/health", "/api/auth/login"}
 
-    if request.method == "OPTIONS" or path in public_paths or not path.startswith("/api/"):
+    host_header = (request.headers.get("host") or "").split(":", 1)[0].lower()
+    is_local_request = host_header in {"localhost", "127.0.0.1", "::1"}
+
+    if (
+        request.method == "OPTIONS"
+        or path in public_paths
+        or not path.startswith("/api/")
+        or is_local_request
+    ):
         return await call_next(request)
 
     if not _auth_configured():
@@ -1006,7 +1014,7 @@ def rebuild_paper_state(trades):
 SCANNER_CACHE_TTL_SECONDS = 60
 # Keep scanner concurrency deliberately small on memory-constrained hosts
 # such as Render's 512 MB instances. Override with SCANNER_MAX_WORKERS if needed.
-SCANNER_MAX_WORKERS = max(1, min(2, int(os.getenv("SCANNER_MAX_WORKERS", "2"))))
+SCANNER_MAX_WORKERS = max(1, min(2, int(os.getenv("SCANNER_MAX_WORKERS", "1"))))
 scanner_cache = {}
 
 # Only one expensive full-market scan may download/process data at a time.

@@ -7,7 +7,11 @@ import IntradayChart from "./IntradayChart";
 // ============================================================
 
 const BACKEND =
-  import.meta.env.VITE_BACKEND_URL || "https://stock-analyser-z5sc.onrender.com";
+  import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+
+const IS_LOCAL_BACKEND = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(
+  BACKEND
+);
 
 const PAPER_STOCK_OPTIONS = [
   ["RELIANCE", "Reliance Industries"],
@@ -358,7 +362,10 @@ export default function App() {
   const [tradeNotificationsEnabled, setTradeNotificationsEnabled] =
     useState(() => {
       if (!("Notification" in window)) return false;
-      return Notification.permission === "granted";
+      const saved = window.localStorage.getItem(
+        "stock_analyser_qualified_alerts"
+      );
+      return saved !== "disabled";
     });
   const notifiedQualifiedSignalsRef = React.useRef(new Set());
 
@@ -523,12 +530,15 @@ export default function App() {
   useEffect(() => {
     if (!("Notification" in window)) return;
 
-    if (Notification.permission === "granted") {
-      setTradeNotificationsEnabled(true);
+    const saved = window.localStorage.getItem(
+      "stock_analyser_qualified_alerts"
+    );
+
+    if (saved === null) {
       window.localStorage.setItem("stock_analyser_qualified_alerts", "enabled");
-    } else if (Notification.permission === "denied") {
-      setTradeNotificationsEnabled(false);
-      window.localStorage.removeItem("stock_analyser_qualified_alerts");
+      setTradeNotificationsEnabled(true);
+    } else {
+      setTradeNotificationsEnabled(saved !== "disabled");
     }
   }, []);
 
@@ -547,9 +557,9 @@ export default function App() {
         body: "Alerts will appear only when a BUY or SELL setup passes the strict qualification filters.",
       });
     } else {
-      setTradeNotificationsEnabled(false);
-      window.localStorage.removeItem("stock_analyser_qualified_alerts");
-      alert("Please allow notifications for this site in your browser settings.");
+      setTradeNotificationsEnabled(true);
+      window.localStorage.setItem("stock_analyser_qualified_alerts", "enabled");
+      alert("Qualified Alerts remain ON. Please allow notifications for this site in your browser settings to receive desktop pop-ups.");
     }
   }
 
@@ -1494,6 +1504,12 @@ export default function App() {
 
   useEffect(() => {
     async function restoreLogin() {
+      if (IS_LOCAL_BACKEND) {
+        setIsAuthenticated(true);
+        setAuthChecking(false);
+        return;
+      }
+
       const token = window.localStorage.getItem("stock_analyser_auth_token");
       if (!token) {
         setAuthChecking(false);
@@ -2488,7 +2504,13 @@ export default function App() {
                 type="button"
                 onClick={
                   tradeNotificationsEnabled
-                    ? () => setTradeNotificationsEnabled(false)
+                    ? () => {
+                        setTradeNotificationsEnabled(false);
+                        window.localStorage.setItem(
+                          "stock_analyser_qualified_alerts",
+                          "disabled"
+                        );
+                      }
                     : enableTradeNotifications
                 }
                 style={{

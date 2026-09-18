@@ -1,5 +1,7 @@
 import React, { useMemo } from "react";
 import {
+  Bar,
+  Cell,
   CartesianGrid,
   ComposedChart,
   Line,
@@ -74,36 +76,28 @@ function formatVolume(value) {
 }
 
 function CandleShape(props) {
-  const { x, width, yAxis, payload } = props;
-
-  if (!payload || !yAxis?.scale) return null;
+  const { x, width, y, height, payload } = props;
+  if (!payload) return null;
 
   const { open, high, low, close } = payload;
+  if (![open, high, low, close].every(Number.isFinite)) return null;
 
-  if (
-    !Number.isFinite(open) ||
-    !Number.isFinite(high) ||
-    !Number.isFinite(low) ||
-    !Number.isFinite(close)
-  ) {
-    return null;
-  }
+  // Recharts range Bar maps [low, high] to this pixel rectangle.
+  // We calculate the open/close body inside that same high-low range.
+  const priceRange = Math.max(high - low, 0.000001);
+  const highY = y;
+  const lowY = y + height;
+  const priceToY = (price) =>
+    highY + ((high - price) / priceRange) * height;
 
-  const scale = yAxis.scale;
-  const highY = scale(high);
-  const lowY = scale(low);
-  const openY = scale(open);
-  const closeY = scale(close);
-
+  const openY = priceToY(open);
+  const closeY = priceToY(close);
   const centerX = x + width / 2;
-  const candleWidth = Math.max(3, Math.min(12, width * 0.68));
-  const bodyX = centerX - candleWidth / 2;
+  const candleWidth = Math.max(3, Math.min(12, width * 0.72));
   const bodyY = Math.min(openY, closeY);
   const bodyHeight = Math.max(2, Math.abs(closeY - openY));
-
   const rising = close >= open;
-  const candleColor = rising ? "#16a34a" : "#dc2626";
-  const candleFill = rising ? "#bbf7d0" : "#fecaca";
+  const candleColor = rising ? "#00b386" : "#eb5b3c";
 
   return (
     <g>
@@ -115,15 +109,14 @@ function CandleShape(props) {
         stroke={candleColor}
         strokeWidth={1.4}
       />
-
       <rect
-        x={bodyX}
+        x={centerX - candleWidth / 2}
         y={bodyY}
         width={candleWidth}
         height={bodyHeight}
-        fill={candleFill}
+        fill={candleColor}
         stroke={candleColor}
-        strokeWidth={1.4}
+        strokeWidth={1.2}
       />
     </g>
   );
@@ -307,6 +300,10 @@ export default function IntradayChart({
           vwap: getValue(row, ["vwap", "VWAP"]),
           ema9: getValue(row, ["ema9", "EMA9", "ema_9"]),
           ema20: getValue(row, ["ema20", "EMA20", "ema_20"]),
+          candleRange: [
+            getValue(row, ["low", "Low"]),
+            getValue(row, ["high", "High"]),
+          ],
         }))
         .filter(
           (row) =>
@@ -349,25 +346,6 @@ export default function IntradayChart({
       values.push(row.low, row.high);
     });
 
-    [
-      analysis?.current_price,
-      analysis?.price,
-      analysis?.entry_price,
-      analysis?.stop_loss,
-      analysis?.target_1,
-      analysis?.target1,
-      analysis?.target_2,
-      analysis?.target2,
-      analysis?.support,
-      analysis?.resistance,
-      currentPosition?.average_price,
-      currentPosition?.stop_loss,
-      currentPosition?.exit_target,
-    ].forEach((value) => {
-      const parsed = numberValue(value);
-      if (parsed !== null) values.push(parsed);
-    });
-
     let min = Math.min(...values);
     let max = Math.max(...values);
 
@@ -379,7 +357,7 @@ export default function IntradayChart({
     const padding = range * 0.1;
 
     return [Math.max(0, min - padding), max + padding];
-  }, [chartData, analysis, currentPosition]);
+  }, [chartData]);
 
   if (!chartData.length) {
     return (
@@ -597,7 +575,7 @@ export default function IntradayChart({
       <div
         style={{
           width: "100%",
-          height: 500,
+          height: 520,
           background: "#ffffff",
           border: "1px solid #e2e8f0",
           borderRadius: 10,
@@ -608,6 +586,7 @@ export default function IntradayChart({
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart
             data={chartData}
+            barCategoryGap="18%"
             margin={{
               top: 22,
               right: 18,
@@ -615,7 +594,7 @@ export default function IntradayChart({
               left: 8,
             }}
           >
-            <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
+            <CartesianGrid stroke="#edf1f5" strokeDasharray="3 3" />
 
             <XAxis
               dataKey="label"
@@ -645,12 +624,9 @@ export default function IntradayChart({
             <Tooltip content={<ChartTooltip />} />
 
             {chartType === "CANDLE" ? (
-              <Line
-                type="linear"
-                dataKey="close"
-                stroke="transparent"
-                dot={<CandleShape />}
-                activeDot={false}
+              <Bar
+                dataKey="candleRange"
+                shape={(props) => <CandleShape {...props} />}
                 isAnimationActive={false}
               />
             ) : (
@@ -831,6 +807,55 @@ export default function IntradayChart({
                 />
               );
             })}
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div
+        style={{
+          width: "100%",
+          height: 115,
+          marginTop: 8,
+          background: "#ffffff",
+          border: "1px solid #e2e8f0",
+          borderRadius: 10,
+          padding: "4px 6px 0 0",
+          boxSizing: "border-box",
+        }}
+      >
+        <ResponsiveContainer width="100%" height="100%">
+          <ComposedChart
+            data={chartData}
+            barCategoryGap="18%"
+            margin={{ top: 6, right: 88, bottom: 5, left: 8 }}
+          >
+            <CartesianGrid vertical={false} stroke="#edf1f5" />
+            <XAxis dataKey="label" hide />
+            <YAxis
+              orientation="right"
+              width={70}
+              axisLine={false}
+              tickLine={false}
+              tick={{ fontSize: 9, fill: "#64748b" }}
+              tickFormatter={(value) =>
+                Number(value).toLocaleString("en-IN", { notation: "compact" })
+              }
+            />
+            <Tooltip
+              formatter={(value) => [
+                Number(value).toLocaleString("en-IN"),
+                "Volume",
+              ]}
+            />
+            <Bar dataKey="volume" isAnimationActive={false}>
+              {chartData.map((row, index) => (
+                <Cell
+                  key={`volume-${index}`}
+                  fill={row.close >= row.open ? "#00b386" : "#eb5b3c"}
+                  fillOpacity={0.72}
+                />
+              ))}
+            </Bar>
           </ComposedChart>
         </ResponsiveContainer>
       </div>

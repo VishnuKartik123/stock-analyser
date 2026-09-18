@@ -1650,18 +1650,29 @@ export default function App() {
   }, [symbol, intradayInterval]);
 
   // ==========================================================
-  // AUTO REFRESH INTRADAY EVERY 60 SECONDS
+  // LIVE SELECTED-STOCK CANDLE REFRESH
+  // Refresh only the selected intraday stock every 15 seconds.
+  // The all-stock scanner remains on its slower refresh cycle.
   // ==========================================================
 
   useEffect(() => {
-    if (!symbol) return;
+    if (!symbol || analysisCategory !== "INTRADAY") return;
 
-    const intervalId = setInterval(() => {
-      loadIntraday(symbol);
-    }, 60000);
+    const refreshSelectedStock = () => {
+      if (document.visibilityState === "visible") {
+        loadIntraday(symbol, intradayChartPeriod);
+      }
+    };
+
+    const intervalId = setInterval(refreshSelectedStock, 15000);
 
     return () => clearInterval(intervalId);
-  }, [symbol, intradayInterval]);
+  }, [
+    symbol,
+    intradayInterval,
+    intradayChartPeriod,
+    analysisCategory,
+  ]);
 
   // ==========================================================
   // RELOAD SCANNER WHEN TIMEFRAME CHANGES
@@ -4143,6 +4154,12 @@ export default function App() {
                   <IntradayChart
                     data={intradayData}
                     chartType={intradayChartType}
+                    symbol={symbol}
+                    interval={intradayInterval}
+                    analysis={intraday}
+                    positions={dayTradePositions}
+                    trades={dayTradeTrades}
+                    live={String(intraday?.market_status || scannerMarketStatus).toUpperCase() === "OPEN"}
                   />
                 ) : (
                   <div

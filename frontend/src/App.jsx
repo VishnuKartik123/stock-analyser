@@ -4093,6 +4093,9 @@ export default function App() {
                         outline: "none",
                       }}
                     >
+                      <option value="5m">5 Minutes</option>
+                      <option value="15m">15 Minutes</option>
+                      <option value="30m">30 Minutes</option>
                       <option value="1d">1 Day</option>
                       <option value="2d">2 Days</option>
                       <option value="5d">5 Days</option>

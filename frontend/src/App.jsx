@@ -481,7 +481,8 @@ export default function App() {
 
   async function loadIntraday(
     selectedSymbol = symbol,
-    selectedPeriod = intradayChartPeriod
+    selectedPeriod = intradayChartPeriod,
+    selectedInterval = intradayInterval
   ) {
     if (!selectedSymbol) return;
 
@@ -493,11 +494,11 @@ export default function App() {
 
       const [analysisData, historyData] = await Promise.all([
         fetchJson(
-          `${BACKEND}/api/stock/intraday-analysis?symbol=${encodedSymbol}&interval=${intradayInterval}`
+          `${BACKEND}/api/stock/intraday-analysis?symbol=${encodedSymbol}&interval=${selectedInterval}`
         ),
 
         fetchJson(
-          `${BACKEND}/api/stock/intraday-history?symbol=${encodedSymbol}&interval=${intradayInterval}&period=${selectedPeriod}`
+          `${BACKEND}/api/stock/intraday-history?symbol=${encodedSymbol}&interval=${selectedInterval}&period=${selectedPeriod}`
         ),
       ]);
 
@@ -4075,6 +4076,30 @@ export default function App() {
                     }}
                   >
                     <select
+                      value={intradayInterval}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setIntradayInterval(value);
+                        loadIntraday(symbol, intradayChartPeriod, value);
+                      }}
+                      title="Candle interval"
+                      style={{
+                        padding: "8px 34px 8px 11px",
+                        borderRadius: 7,
+                        border: "1px solid #7c3aed",
+                        background: "#ffffff",
+                        color: "#6d28d9",
+                        fontWeight: 800,
+                        cursor: "pointer",
+                        outline: "none",
+                      }}
+                    >
+                      <option value="5m">5 Min</option>
+                      <option value="15m">15 Min</option>
+                      <option value="30m">30 Min</option>
+                    </select>
+
+                    <select
                       value={intradayChartPeriod}
                       onChange={(event) => {
                         const value = event.target.value;
@@ -4093,17 +4118,11 @@ export default function App() {
                         outline: "none",
                       }}
                     >
-                      <option value="5m">5 Minutes</option>
-                      <option value="15m">15 Minutes</option>
-                      <option value="30m">30 Minutes</option>
                       <option value="1d">1 Day</option>
                       <option value="2d">2 Days</option>
                       <option value="5d">5 Days</option>
                       <option value="1wk">1 Week</option>
                       <option value="1mo">1 Month</option>
-                      <option value="3mo">3 Months</option>
-                      <option value="6mo">6 Months</option>
-                      <option value="1y">1 Year</option>
                     </select>
 
                     <div

@@ -64,14 +64,15 @@ function formatCandleTime(unixTime) {
   const x = Number(unixTime);
   if (!Number.isFinite(x)) return "—";
 
-  return new Date(x * 1000).toLocaleString("en-IN", {
+  return new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
     day: "2-digit",
     month: "short",
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
     hour12: true,
-  });
+  }).format(new Date(x * 1000));
 }
 
 function patternsFrom(analysis) {
@@ -83,6 +84,19 @@ function patternsFrom(analysis) {
   }
 
   return [];
+}
+
+const IST_TIME_FORMATTER = new Intl.DateTimeFormat("en-IN", {
+  timeZone: "Asia/Kolkata",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
+function formatAxisTimeIST(timestamp) {
+  const x = Number(timestamp);
+  if (!Number.isFinite(x)) return "";
+  return IST_TIME_FORMATTER.format(new Date(x * 1000));
 }
 
 export default function IntradayChart({
@@ -102,6 +116,11 @@ export default function IntradayChart({
   const [showEma20, setShowEma20] = useState(true);
   const [hoveredCandle, setHoveredCandle] = useState(null);
   const [selectedCandle, setSelectedCandle] = useState(null);
+  const [visibleBars, setVisibleBars] = useState(80);
+  const [scrollStart, setScrollStart] = useState(0);
+  const [showPatternMarkers, setShowPatternMarkers] = useState(true);
+  const savedLogicalRangeRef = useRef(null);
+  const applyingRangeRef = useRef(false);
 
   const rows = useMemo(() => {
     const source = Array.isArray(data) ? data : [];
@@ -124,6 +143,10 @@ export default function IntradayChart({
           vwap: get(row, ["vwap", "VWAP"]),
           ema9: get(row, ["ema9", "EMA9", "ema_9"]),
           ema20: get(row, ["ema20", "EMA20", "ema_20"]),
+          patterns: Array.isArray(row?.patterns) ? row.patterns : [],
+          patternStatus: row?.pattern_status || null,
+          patternTechnicalExecutable:
+            row?.pattern_technical_executable === true,
         };
       })
       .filter((r) =>
@@ -184,6 +207,10 @@ export default function IntradayChart({
       : null;
 
   const displayCandle = selectedCandle || hoveredCandle || latest || null;
+  const displayPatterns = Array.isArray(displayCandle?.patterns)
+    ? displayCandle.patterns
+    : [];
+  const livePattern = analysis?.live_pattern_analysis || null;
 
   useEffect(() => {
     if (!priceRef.current || !volumeRef.current || !rows.length) return;
@@ -211,9 +238,11 @@ export default function IntradayChart({
         borderColor: "#e5e7eb",
         timeVisible: true,
         secondsVisible: false,
+        tickMarkFormatter: (time) => formatAxisTimeIST(time),
       },
       localization: {
         priceFormatter: (price) => `₹${Number(price).toFixed(2)}`,
+        timeFormatter: (time) => formatAxisTimeIST(time),
       },
       crosshair: {
         vertLine: {
@@ -356,36 +385,78 @@ export default function IntradayChart({
       (t) => String(t?.symbol || "").toUpperCase() === selected
     );
 
-    if (
-      selectedTrades.length &&
-      candleSeries &&
-      String(chartType).toUpperCase() === "CANDLE"
-    ) {
-      const markers = selectedTrades
-        .map((trade) => {
-          const side = String(trade?.side || "").toUpperCase();
-          const action = String(trade?.action || "").toUpperCase();
-          const exit =
-            action.includes("EXIT") ||
-            action.includes("CLOSE") ||
-            action.includes("TARGET") ||
-            action.includes("STOP");
+    if (candleSeries && String(chartType).toUpperCase() === "CANDLE") {
+      const patternMarkers = showPatternMarkers
+        ? rows.flatMap((row) => {
+        const candlePatterns = Array.isArray(row.patterns) ? row.patterns : [];
 
-          return {
-            time: toUnix(trade?.timestamp, rows[rows.length - 1].time),
-            position: exit || side === "SELL" ? "aboveBar" : "belowBar",
-            color: exit ? ORANGE : side === "BUY" ? GREEN : RED,
-            shape: exit || side === "SELL" ? "arrowDown" : "arrowUp",
-            text: exit ? "EXIT" : side || "TRADE",
-          };
-        })
-        .sort((a, b) => a.time - b.time);
+        return candlePatterns
+          .filter((pattern) => {
+            const direction = String(pattern?.direction || "").toUpperCase();
+            const forming =
+              String(pattern?.status || "").toUpperCase() === "FORMING";
 
-      try {
-        createSeriesMarkers(candleSeries, markers);
-      } catch (_) {
-        // Keep the chart usable if a historical trade timestamp
-        // cannot be attached to the currently loaded range.
+            // Keep the chart clean:
+            // 1) show the current forming pattern live, or
+            // 2) show only confirmed historical patterns that passed the
+            //    technical execution-context filter.
+            return (
+              (direction === "BULLISH" || direction === "BEARISH") &&
+              (forming || pattern?.technical_executable === true)
+            );
+          })
+          .map((pattern) => {
+            const direction = String(pattern?.direction || "").toUpperCase();
+            const forming = String(pattern?.status || "").toUpperCase() === "FORMING";
+            const executable = pattern?.technical_executable === true;
+
+            return {
+              time: row.time,
+              position: direction === "BULLISH" ? "belowBar" : "aboveBar",
+              color: forming
+                ? ORANGE
+                : executable
+                  ? direction === "BULLISH"
+                    ? GREEN
+                    : RED
+                  : "#667085",
+              shape: direction === "BULLISH" ? "arrowUp" : "arrowDown",
+              text: forming
+                ? `${String(pattern?.name || "PATTERN").replaceAll("_", " ")} • FORMING`
+                : `${String(pattern?.name || "PATTERN").replaceAll("_", " ")} • EXEC`,
+            };
+          });
+      })
+        : [];
+
+      const tradeMarkers = selectedTrades.map((trade) => {
+        const side = String(trade?.side || "").toUpperCase();
+        const action = String(trade?.action || "").toUpperCase();
+        const exit =
+          action.includes("EXIT") ||
+          action.includes("CLOSE") ||
+          action.includes("TARGET") ||
+          action.includes("STOP");
+
+        return {
+          time: toUnix(trade?.timestamp, rows[rows.length - 1].time),
+          position: exit || side === "SELL" ? "aboveBar" : "belowBar",
+          color: exit ? ORANGE : side === "BUY" ? GREEN : RED,
+          shape: exit || side === "SELL" ? "arrowDown" : "arrowUp",
+          text: exit ? "EXIT" : side || "TRADE",
+        };
+      });
+
+      const markers = [...patternMarkers, ...tradeMarkers].sort(
+        (a, b) => a.time - b.time
+      );
+
+      if (markers.length) {
+        try {
+          createSeriesMarkers(candleSeries, markers);
+        } catch (_) {
+          // Keep chart usable if a marker timestamp is outside loaded data.
+        }
       }
     }
 
@@ -427,29 +498,79 @@ export default function IntradayChart({
 
     priceChart.subscribeClick(clickHandler);
 
-    // Keep the entire returned market session visible from the first candle
-    // to the final candle. For a 1-day request this means market open through
-    // market close (or the latest candle while the market is still open).
-    priceChart.timeScale().fitContent();
-    volumeChart.timeScale().fitContent();
+    // Easy candle viewing: start from the LEFT and show a readable number
+    // of candles instead of squeezing the whole session into tiny candles.
+    const totalBars = rows.length;
+    const barsToShow =
+      visibleBars === 0
+        ? totalBars
+        : Math.min(Math.max(visibleBars, 10), totalBars);
 
-    // Keep candles comfortably wide while still allowing zoom/scroll.
+    if (totalBars > 0) {
+      const maxStart = Math.max(totalBars - barsToShow, 0);
+      const centeredStart = Math.floor(maxStart / 2);
+      const requestedStart =
+        scrollStart === 0 ? centeredStart : scrollStart;
+      const start = Math.min(Math.max(requestedStart, 0), maxStart);
+      const end = Math.min(start + barsToShow - 1, totalBars - 1);
+
+      const saved = savedLogicalRangeRef.current;
+      const rangeToApply =
+        saved &&
+        Number.isFinite(saved.from) &&
+        Number.isFinite(saved.to) &&
+        saved.to > saved.from
+          ? saved
+          : { from: start, to: end };
+
+      applyingRangeRef.current = true;
+      priceChart.timeScale().setVisibleLogicalRange(rangeToApply);
+      volumeChart.timeScale().setVisibleLogicalRange(rangeToApply);
+      applyingRangeRef.current = false;
+    }
+
     priceChart.timeScale().applyOptions({
-      barSpacing: 8,
-      minBarSpacing: 3,
-      rightOffset: 3,
+      rightOffset: 0,
+      fixLeftEdge: false,
+      fixRightEdge: false,
+      barSpacing: 9,
+      minBarSpacing: 4,
     });
 
     volumeChart.timeScale().applyOptions({
-      barSpacing: 8,
-      minBarSpacing: 3,
-      rightOffset: 3,
+      rightOffset: 0,
+      fixLeftEdge: false,
+      fixRightEdge: false,
+      barSpacing: 9,
+      minBarSpacing: 4,
     });
+
+    // applyOptions(barSpacing) can alter the viewport. Restore the saved
+    // manual zoom once more after all time-scale options have been applied.
+    if (savedLogicalRangeRef.current) {
+      applyingRangeRef.current = true;
+      priceChart.timeScale().setVisibleLogicalRange(savedLogicalRangeRef.current);
+      volumeChart.timeScale().setVisibleLogicalRange(savedLogicalRangeRef.current);
+      applyingRangeRef.current = false;
+    }
 
     let syncing = false;
 
     const syncPrice = (range) => {
       if (!range || syncing) return;
+
+      if (
+        !applyingRangeRef.current &&
+        Number.isFinite(range.from) &&
+        Number.isFinite(range.to) &&
+        range.to > range.from
+      ) {
+        savedLogicalRangeRef.current = {
+          from: range.from,
+          to: range.to,
+        };
+      }
+
       syncing = true;
       volumeChart.timeScale().setVisibleLogicalRange(range);
       syncing = false;
@@ -482,6 +603,23 @@ export default function IntradayChart({
     window.addEventListener("resize", resize);
 
     return () => {
+      // Save the exact user zoom/pan before this chart instance is destroyed
+      // by a live-data refresh. The next instance restores this range.
+      try {
+        const currentRange = priceChart.timeScale().getVisibleLogicalRange();
+        if (
+          currentRange &&
+          Number.isFinite(currentRange.from) &&
+          Number.isFinite(currentRange.to) &&
+          currentRange.to > currentRange.from
+        ) {
+          savedLogicalRangeRef.current = {
+            from: currentRange.from,
+            to: currentRange.to,
+          };
+        }
+      } catch (_) {}
+
       window.removeEventListener("resize", resize);
       try {
         priceChart.unsubscribeCrosshairMove(crosshairHandler);
@@ -501,6 +639,9 @@ export default function IntradayChart({
     selected,
     showEma9,
     showEma20,
+    visibleBars,
+    scrollStart,
+    showPatternMarkers,
   ]);
 
   const patterns = patternsFrom(analysis);
@@ -635,11 +776,79 @@ export default function IntradayChart({
           EMA 20
         </button>
 
+          <button
+            type="button"
+            onClick={() => setShowPatternMarkers((value) => !value)}
+            style={{
+              border: showPatternMarkers
+                ? "1px solid #7f56d9"
+                : "1px solid #d0d5dd",
+              background: showPatternMarkers ? "#f4f3ff" : "#ffffff",
+              color: showPatternMarkers ? "#6941c6" : "#667085",
+              borderRadius: 7,
+              padding: "5px 9px",
+              fontSize: 11,
+              fontWeight: 800,
+              cursor: "pointer",
+            }}
+            title="Show or hide Morning Star, Hammer, Engulfing and other candle-pattern markers"
+          >
+            Patterns {showPatternMarkers ? "ON" : "OFF"}
+          </button>
+
         <span style={{ color: PURPLE, marginLeft: 4 }}>--- VWAP</span>
         <span>Entry {money(entry)}</span>
         <span style={{ color: RED }}>SL {money(stop)}</span>
         <span style={{ color: GREEN }}>T1 {money(t1)}</span>
         <span style={{ color: "#15803d" }}>T2 {money(t2)}</span>
+      </div>
+
+      <div
+        style={{
+          padding: "8px 18px",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          flexWrap: "wrap",
+          borderBottom: "1px solid #e5e7eb",
+          background: "#ffffff",
+        }}
+      >
+        <strong style={{ fontSize: 12, color: "#475467" }}>Candle view:</strong>
+        {[
+          [40, "40"],
+          [80, "80"],
+          [120, "120"],
+          [0, "All"],
+        ].map(([value, label]) => (
+          <button
+            key={label}
+            type="button"
+            onClick={() => {
+              savedLogicalRangeRef.current = null;
+              setVisibleBars(value);
+              setScrollStart(0);
+            }}
+            style={{
+              padding: "5px 11px",
+              borderRadius: 7,
+              border:
+                visibleBars === value
+                  ? "1px solid #2563eb"
+                  : "1px solid #d0d5dd",
+              background: visibleBars === value ? "#eff6ff" : "#ffffff",
+              color: visibleBars === value ? "#1d4ed8" : "#475467",
+              fontSize: 12,
+              fontWeight: 800,
+              cursor: "pointer",
+            }}
+          >
+            {label}
+          </button>
+        ))}
+        <span style={{ fontSize: 11, color: "#667085" }}>
+          40 = larger candles · 80 = normal · 120 = more candles · All = full session
+        </span>
       </div>
 
       <div
@@ -719,6 +928,65 @@ export default function IntradayChart({
         </span>
       </div>
 
+      <div
+        style={{
+          padding: "8px 18px 10px",
+          borderBottom: "1px solid #e5e7eb",
+          background: "#fafafa",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 10,
+            marginBottom: 5,
+            fontSize: 11,
+          }}
+        >
+          <strong style={{ color: "#475467" }}>Time navigator</strong>
+          <span style={{ color: "#667085" }}>
+            Drag left / right to move through candles
+          </span>
+        </div>
+
+        <input
+          type="range"
+          min={0}
+          max={Math.max(
+            rows.length -
+              (visibleBars === 0
+                ? rows.length
+                : Math.min(Math.max(visibleBars, 10), rows.length)),
+            0
+          )}
+          step={1}
+          value={Math.min(
+            scrollStart,
+            Math.max(
+              rows.length -
+                (visibleBars === 0
+                  ? rows.length
+                  : Math.min(Math.max(visibleBars, 10), rows.length)),
+              0
+            )
+          )}
+          onChange={(event) => {
+            savedLogicalRangeRef.current = null;
+            setScrollStart(Number(event.target.value));
+          }}
+          disabled={visibleBars === 0 || rows.length <= visibleBars}
+          aria-label="Chart time navigator"
+          style={{
+            width: "100%",
+            cursor:
+              visibleBars === 0 || rows.length <= visibleBars
+                ? "default"
+                : "ew-resize",
+          }}
+        />
+      </div>
+
       <div ref={priceRef} style={{ width: "100%", height: 470 }} />
 
       <div
@@ -734,6 +1002,70 @@ export default function IntradayChart({
       </div>
 
       <div ref={volumeRef} style={{ width: "100%", height: 115 }} />
+
+      <div
+        style={{
+          margin: "12px 16px 0",
+          padding: 12,
+          border: "1px solid #e5e7eb",
+          borderRadius: 10,
+          background: "#ffffff",
+          fontSize: 13,
+          lineHeight: 1.7,
+        }}
+      >
+        <div style={{ fontWeight: 900, marginBottom: 5 }}>
+          Live candle-pattern monitor
+        </div>
+        <div>
+          <b>Latest pattern:</b>{" "}
+          {Array.isArray(livePattern?.patterns) && livePattern.patterns.length
+            ? livePattern.patterns
+                .map((p) => String(p?.name || p).replaceAll("_", " "))
+                .join(", ")
+            : "No strong pattern"}
+        </div>
+        <div>
+          <b>Status:</b>{" "}
+          {livePattern?.status || "—"}
+        </div>
+        <div>
+          <b>Trade executable:</b>{" "}
+          {livePattern?.executable === true
+            ? "YES"
+            : livePattern?.status === "FORMING"
+              ? "WAIT FOR CANDLE CLOSE"
+              : "NO"}
+        </div>
+        <div style={{ color: "#667085" }}>
+          {livePattern?.message || "Waiting for live pattern analysis."}
+        </div>
+
+        {displayPatterns.length > 0 && (
+          <div
+            style={{
+              marginTop: 9,
+              paddingTop: 9,
+              borderTop: "1px dashed #d0d5dd",
+            }}
+          >
+            <b>Selected candle pattern:</b>{" "}
+            {displayPatterns
+              .map((p) => String(p?.name || p).replaceAll("_", " "))
+              .join(", ")}
+            {" • "}
+            <b>Status:</b>{" "}
+            {displayPatterns.some((p) => p?.status === "FORMING")
+              ? "FORMING"
+              : "CONFIRMED"}
+            {" • "}
+            <b>Historical technical setup:</b>{" "}
+            {displayPatterns.some((p) => p?.technical_executable === true)
+              ? "YES"
+              : "NO"}
+          </div>
+        )}
+      </div>
 
       <div
         style={{

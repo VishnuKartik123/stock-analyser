@@ -4074,42 +4074,34 @@ export default function App() {
                       alignItems: "center",
                     }}
                   >
-                    {[
-                      ["1d", "1D"],
-                      ["2d", "2D"],
-                      ["5d", "5D"],
-                      ["1wk", "1 Week"],
-                      ["1mo", "1 Month"],
-                    ].map(([value, label]) => (
-                      <button
-                        key={value}
-                        type="button"
-                        onClick={() => {
-                          setIntradayChartPeriod(value);
-                          loadIntraday(symbol, value);
-                        }}
-                        style={{
-                          padding: "7px 10px",
-                          borderRadius: 7,
-                          border:
-                            intradayChartPeriod === value
-                              ? "1px solid #2563eb"
-                              : "1px solid #cbd5e1",
-                          background:
-                            intradayChartPeriod === value
-                              ? "#dbeafe"
-                              : "#ffffff",
-                          color:
-                            intradayChartPeriod === value
-                              ? "#1d4ed8"
-                              : "#475569",
-                          fontWeight: 800,
-                          cursor: "pointer",
-                        }}
-                      >
-                        {label}
-                      </button>
-                    ))}
+                    <select
+                      value={intradayChartPeriod}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setIntradayChartPeriod(value);
+                        loadIntraday(symbol, value);
+                      }}
+                      title="Chart period"
+                      style={{
+                        padding: "8px 34px 8px 11px",
+                        borderRadius: 7,
+                        border: "1px solid #2563eb",
+                        background: "#ffffff",
+                        color: "#1d4ed8",
+                        fontWeight: 800,
+                        cursor: "pointer",
+                        outline: "none",
+                      }}
+                    >
+                      <option value="1d">1 Day</option>
+                      <option value="2d">2 Days</option>
+                      <option value="5d">5 Days</option>
+                      <option value="1wk">1 Week</option>
+                      <option value="1mo">1 Month</option>
+                      <option value="3mo">3 Months</option>
+                      <option value="6mo">6 Months</option>
+                      <option value="1y">1 Year</option>
+                    </select>
 
                     <div
                       style={{

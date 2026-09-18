@@ -1,278 +1,50 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import {
-  Bar,
-  Cell,
-  CartesianGrid,
-  ComposedChart,
-  Line,
-  ReferenceDot,
-  ReferenceLine,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+  createChart,
+  CandlestickSeries,
+  LineSeries,
+  HistogramSeries,
+  createSeriesMarkers,
+} from "lightweight-charts";
 
-function numberValue(value) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+const GREEN = "#00b386";
+const RED = "#eb5b3c";
+const BLUE = "#387ed1";
+const ORANGE = "#f59e0b";
+const PURPLE = "#7c3aed";
+
+function num(v) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : null;
 }
 
-function getValue(row, keys) {
+function get(row, keys) {
   for (const key of keys) {
-    if (row?.[key] !== undefined && row?.[key] !== null) {
-      const value = numberValue(row[key]);
-      if (value !== null) return value;
-    }
+    const x = num(row?.[key]);
+    if (x !== null) return x;
   }
   return null;
 }
 
-function getRawTime(row) {
-  return (
-    row?.datetime ??
-    row?.Datetime ??
-    row?.date ??
-    row?.Date ??
-    row?.timestamp ??
-    row?.time ??
-    ""
-  );
+function rawTime(row) {
+  return row?.datetime ?? row?.Datetime ?? row?.timestamp ?? row?.time ?? row?.date ?? row?.Date ?? null;
 }
 
-function getTimeLabel(row, index) {
-  const raw = getRawTime(row);
-  if (!raw) return String(index + 1);
-
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return String(raw);
-
-  return date.toLocaleString("en-IN", {
-    day: "2-digit",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
+function toUnix(value, fallback) {
+  if (!value) return fallback;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : fallback;
 }
 
-function money(value) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return "—";
-
-  return `₹${parsed.toLocaleString("en-IN", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
+function money(v) {
+  const x = num(v);
+  return x === null ? "—" : `₹${x.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-function formatVolume(value) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return "—";
-
-  return parsed.toLocaleString("en-IN", {
-    maximumFractionDigits: 0,
-  });
-}
-
-function CandleShape(props) {
-  const { x, width, y, height, payload } = props;
-  if (!payload) return null;
-
-  const { open, high, low, close } = payload;
-  if (![open, high, low, close].every(Number.isFinite)) return null;
-
-  // Recharts range Bar maps [low, high] to this pixel rectangle.
-  // We calculate the open/close body inside that same high-low range.
-  const priceRange = Math.max(high - low, 0.000001);
-  const highY = y;
-  const lowY = y + height;
-  const priceToY = (price) =>
-    highY + ((high - price) / priceRange) * height;
-
-  const openY = priceToY(open);
-  const closeY = priceToY(close);
-  const centerX = x + width / 2;
-  const candleWidth = Math.max(3, Math.min(12, width * 0.72));
-  const bodyY = Math.min(openY, closeY);
-  const bodyHeight = Math.max(2, Math.abs(closeY - openY));
-  const rising = close >= open;
-  const candleColor = rising ? "#00b386" : "#eb5b3c";
-
-  return (
-    <g>
-      <line
-        x1={centerX}
-        x2={centerX}
-        y1={highY}
-        y2={lowY}
-        stroke={candleColor}
-        strokeWidth={1.4}
-      />
-      <rect
-        x={centerX - candleWidth / 2}
-        y={bodyY}
-        width={candleWidth}
-        height={bodyHeight}
-        fill={candleColor}
-        stroke={candleColor}
-        strokeWidth={1.2}
-      />
-    </g>
-  );
-}
-
-function ChartTooltip({ active, payload }) {
-  if (!active || !payload?.length) return null;
-
-  const row = payload[0]?.payload;
-  if (!row) return null;
-
-  return (
-    <div
-      style={{
-        background: "#ffffff",
-        border: "1px solid #cbd5e1",
-        borderRadius: 10,
-        padding: "10px 12px",
-        boxShadow: "0 6px 22px rgba(15, 23, 42, 0.15)",
-        fontSize: 12,
-        lineHeight: 1.6,
-        minWidth: 190,
-      }}
-    >
-      <div style={{ fontWeight: 900, marginBottom: 5 }}>
-        {row.label}
-      </div>
-
-      <div>Open: <strong>{money(row.open)}</strong></div>
-      <div>High: <strong>{money(row.high)}</strong></div>
-      <div>Low: <strong>{money(row.low)}</strong></div>
-      <div>Close: <strong>{money(row.close)}</strong></div>
-
-      {Number.isFinite(row.volume) && (
-        <div>Volume: <strong>{formatVolume(row.volume)}</strong></div>
-      )}
-
-      {Number.isFinite(row.vwap) && (
-        <div>VWAP: <strong>{money(row.vwap)}</strong></div>
-      )}
-
-      {Number.isFinite(row.ema9) && (
-        <div>EMA 9: <strong>{money(row.ema9)}</strong></div>
-      )}
-
-      {Number.isFinite(row.ema20) && (
-        <div>EMA 20: <strong>{money(row.ema20)}</strong></div>
-      )}
-    </div>
-  );
-}
-
-function LevelLabel({ viewBox, text, fill = "#0f172a" }) {
-  const { x, y, width } = viewBox || {};
-
-  if (![x, y, width].every(Number.isFinite)) return null;
-
-  return (
-    <g>
-      <rect
-        x={x + width - 112}
-        y={y - 10}
-        width={108}
-        height={20}
-        rx={5}
-        fill={fill}
-      />
-      <text
-        x={x + width - 58}
-        y={y + 4}
-        textAnchor="middle"
-        fontSize={10}
-        fontWeight={800}
-        fill="#ffffff"
-      >
-        {text}
-      </text>
-    </g>
-  );
-}
-
-function MarkerLabel({ viewBox, text, fill }) {
-  const { x, y } = viewBox || {};
-  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
-
-  return (
-    <g>
-      <rect
-        x={x - 44}
-        y={y - 28}
-        width={88}
-        height={20}
-        rx={5}
-        fill={fill}
-      />
-      <text
-        x={x}
-        y={y - 14}
-        textAnchor="middle"
-        fontSize={10}
-        fontWeight={900}
-        fill="#ffffff"
-      >
-        {text}
-      </text>
-    </g>
-  );
-}
-
-function findNearestLabel(chartData, timestamp) {
-  if (!timestamp || !chartData.length) return null;
-
-  const target = new Date(timestamp).getTime();
-  if (!Number.isFinite(target)) return null;
-
-  let best = null;
-  let bestDistance = Infinity;
-
-  chartData.forEach((row) => {
-    const raw = getRawTime(row);
-    const current = new Date(raw).getTime();
-
-    if (!Number.isFinite(current)) return;
-
-    const distance = Math.abs(current - target);
-
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      best = row.label;
-    }
-  });
-
-  return best;
-}
-
-function normalizePatterns(analysis) {
+function patternsFrom(analysis) {
   const detailed = analysis?.chart_analysis?.candlestick_patterns;
-
-  if (Array.isArray(detailed) && detailed.length) {
-    return detailed.map((pattern) => ({
-      name: pattern?.name || "Pattern",
-      direction: String(pattern?.direction || "NEUTRAL").toUpperCase(),
-      strength: numberValue(pattern?.strength),
-    }));
-  }
-
-  const names = analysis?.candle_patterns;
-
-  if (Array.isArray(names)) {
-    return names.map((name) => ({
-      name,
-      direction: "NEUTRAL",
-      strength: null,
-    }));
-  }
-
+  if (Array.isArray(detailed) && detailed.length) return detailed;
+  if (Array.isArray(analysis?.candle_patterns)) return analysis.candle_patterns.map((name) => ({ name }));
   return [];
 }
 
@@ -286,716 +58,225 @@ export default function IntradayChart({
   trades = [],
   live = false,
 }) {
-  const chartData = useMemo(
-    () =>
-      (Array.isArray(data) ? data : [])
-        .map((row, index) => ({
-          ...row,
-          label: getTimeLabel(row, index),
-          open: getValue(row, ["open", "Open"]),
-          high: getValue(row, ["high", "High"]),
-          low: getValue(row, ["low", "Low"]),
-          close: getValue(row, ["close", "Close"]),
-          volume: getValue(row, ["volume", "Volume"]),
-          vwap: getValue(row, ["vwap", "VWAP"]),
-          ema9: getValue(row, ["ema9", "EMA9", "ema_9"]),
-          ema20: getValue(row, ["ema20", "EMA20", "ema_20"]),
-          candleRange: [
-            getValue(row, ["low", "Low"]),
-            getValue(row, ["high", "High"]),
-          ],
-        }))
-        .filter(
-          (row) =>
-            Number.isFinite(row.open) &&
-            Number.isFinite(row.high) &&
-            Number.isFinite(row.low) &&
-            Number.isFinite(row.close)
-        ),
-    [data]
+  const priceRef = useRef(null);
+  const volumeRef = useRef(null);
+
+  const rows = useMemo(() => {
+    const base = Math.floor(Date.now() / 1000) - (Array.isArray(data) ? data.length : 0) * 300;
+    return (Array.isArray(data) ? data : [])
+      .map((row, index) => {
+        const open = get(row, ["open", "Open"]);
+        const high = get(row, ["high", "High"]);
+        const low = get(row, ["low", "Low"]);
+        const close = get(row, ["close", "Close"]);
+        return {
+          time: toUnix(rawTime(row), base + index * 300),
+          open,
+          high,
+          low,
+          close,
+          volume: get(row, ["volume", "Volume"]),
+          vwap: get(row, ["vwap", "VWAP"]),
+          ema9: get(row, ["ema9", "EMA9", "ema_9"]),
+          ema20: get(row, ["ema20", "EMA20", "ema_20"]),
+        };
+      })
+      .filter((r) => [r.open, r.high, r.low, r.close].every(Number.isFinite))
+      .sort((a, b) => a.time - b.time)
+      .filter((r, i, a) => i === 0 || r.time !== a[i - 1].time)
+      .slice(-120);
+  }, [data]);
+
+  const selected = String(symbol || analysis?.symbol || "").toUpperCase();
+  const position = (Array.isArray(positions) ? positions : []).find(
+    (p) => String(p?.symbol || "").toUpperCase() === selected
   );
 
-  const selectedSymbol = String(symbol || analysis?.symbol || "").toUpperCase();
+  const entry = num(position?.average_price) ?? num(analysis?.entry_price);
+  const stop = num(position?.stop_loss) ?? num(analysis?.stop_loss);
+  const t1 = num(position?.exit_target) ?? num(analysis?.target_1) ?? num(analysis?.target1);
+  const t2 = num(analysis?.target_2) ?? num(analysis?.target2);
+  const latest = rows[rows.length - 1];
+  const currentPrice = num(analysis?.current_price) ?? num(analysis?.price) ?? latest?.close ?? null;
+  const previous = rows.length > 1 ? rows[rows.length - 2] : null;
+  const change = currentPrice !== null && previous ? currentPrice - previous.close : null;
+  const changePct = change !== null && previous?.close ? (change / previous.close) * 100 : null;
 
-  const currentPosition = useMemo(
-    () =>
-      (Array.isArray(positions) ? positions : []).find(
-        (position) =>
-          String(position?.symbol || "").toUpperCase() === selectedSymbol
-      ) || null,
-    [positions, selectedSymbol]
-  );
+  useEffect(() => {
+    if (!priceRef.current || !volumeRef.current || !rows.length) return;
 
-  const selectedTrades = useMemo(
-    () =>
-      (Array.isArray(trades) ? trades : [])
-        .filter(
-          (trade) =>
-            String(trade?.symbol || "").toUpperCase() === selectedSymbol
-        )
-        .slice(0, 12),
-    [trades, selectedSymbol]
-  );
+    priceRef.current.innerHTML = "";
+    volumeRef.current.innerHTML = "";
 
-  const domain = useMemo(() => {
-    if (!chartData.length) return ["auto", "auto"];
+    const common = {
+      layout: { background: { color: "#ffffff" }, textColor: "#667085" },
+      grid: { vertLines: { color: "#edf1f5" }, horzLines: { color: "#edf1f5" } },
+      rightPriceScale: { borderColor: "#e5e7eb", scaleMargins: { top: 0.08, bottom: 0.08 } },
+      timeScale: { borderColor: "#e5e7eb", timeVisible: true, secondsVisible: false },
+      localization: { priceFormatter: (price) => `₹${Number(price).toFixed(2)}` },
+      crosshair: { vertLine: { color: "#98a2b3", width: 1 }, horzLine: { color: "#98a2b3", width: 1 } },
+    };
 
-    const values = [];
-
-    chartData.forEach((row) => {
-      values.push(row.low, row.high);
+    const priceChart = createChart(priceRef.current, {
+      ...common,
+      width: priceRef.current.clientWidth,
+      height: 470,
     });
 
-    let min = Math.min(...values);
-    let max = Math.max(...values);
+    const volumeChart = createChart(volumeRef.current, {
+      ...common,
+      width: volumeRef.current.clientWidth,
+      height: 115,
+      rightPriceScale: { borderColor: "#e5e7eb", scaleMargins: { top: 0.15, bottom: 0 } },
+    });
 
-    if (!Number.isFinite(min) || !Number.isFinite(max)) {
-      return ["auto", "auto"];
+    let candleSeries;
+    if (String(chartType).toUpperCase() === "CANDLE") {
+      candleSeries = priceChart.addSeries(CandlestickSeries, {
+        upColor: GREEN,
+        downColor: RED,
+        borderUpColor: GREEN,
+        borderDownColor: RED,
+        wickUpColor: GREEN,
+        wickDownColor: RED,
+        priceLineVisible: true,
+        lastValueVisible: true,
+      });
+      candleSeries.setData(rows.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
+    } else {
+      candleSeries = priceChart.addSeries(LineSeries, { color: BLUE, lineWidth: 2, priceLineVisible: true });
+      candleSeries.setData(rows.map(({ time, close }) => ({ time, value: close })));
     }
 
-    const range = Math.max(max - min, Math.abs(max) * 0.005, 1);
-    const padding = range * 0.1;
+    const addLine = (key, color, width = 2, style = 0) => {
+      const points = rows.filter((r) => Number.isFinite(r[key])).map((r) => ({ time: r.time, value: r[key] }));
+      if (!points.length) return;
+      const s = priceChart.addSeries(LineSeries, { color, lineWidth: width, lineStyle: style, priceLineVisible: false, lastValueVisible: true });
+      s.setData(points);
+    };
 
-    return [Math.max(0, min - padding), max + padding];
-  }, [chartData]);
+    addLine("ema9", ORANGE, 2);
+    addLine("ema20", BLUE, 2);
+    addLine("vwap", PURPLE, 2, 2);
 
-  if (!chartData.length) {
-    return (
-      <div
-        style={{
-          padding: 35,
-          textAlign: "center",
-          color: "#64748b",
-          background: "#f8fafc",
-          borderRadius: 10,
-        }}
-      >
-        No chart data available.
-      </div>
-    );
-  }
+    const addLevel = (price, title, color) => {
+      if (!Number.isFinite(price) || !candleSeries?.createPriceLine) return;
+      candleSeries.createPriceLine({ price, color, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title });
+    };
 
-  const latest = chartData[chartData.length - 1];
-  const previous = chartData.length > 1 ? chartData[chartData.length - 2] : null;
+    addLevel(entry, "ENTRY", BLUE);
+    addLevel(stop, "SL", RED);
+    addLevel(t1, "T1", GREEN);
+    addLevel(t2, "T2", "#15803d");
 
-  const candleChange =
-    previous && Number.isFinite(previous.close) && previous.close !== 0
-      ? ((latest.close - previous.close) / previous.close) * 100
-      : null;
+    const volumeSeries = volumeChart.addSeries(HistogramSeries, { priceFormat: { type: "volume" }, priceLineVisible: false, lastValueVisible: true });
+    volumeSeries.setData(rows.filter((r) => Number.isFinite(r.volume)).map((r) => ({ time: r.time, value: r.volume, color: r.close >= r.open ? "rgba(0,179,134,.65)" : "rgba(235,91,60,.65)" })));
 
-  const currentPrice =
-    numberValue(analysis?.current_price) ??
-    numberValue(analysis?.price) ??
-    latest.close;
+    const selectedTrades = (Array.isArray(trades) ? trades : []).filter((t) => String(t?.symbol || "").toUpperCase() === selected);
+    if (selectedTrades.length && candleSeries && String(chartType).toUpperCase() === "CANDLE") {
+      const markers = selectedTrades.map((trade) => {
+        const side = String(trade?.side || "").toUpperCase();
+        const action = String(trade?.action || "").toUpperCase();
+        const exit = action.includes("EXIT") || action.includes("CLOSE") || action.includes("TARGET") || action.includes("STOP");
+        return {
+          time: toUnix(trade?.timestamp, rows[rows.length - 1].time),
+          position: exit || side === "SELL" ? "aboveBar" : "belowBar",
+          color: exit ? ORANGE : side === "BUY" ? GREEN : RED,
+          shape: exit || side === "SELL" ? "arrowDown" : "arrowUp",
+          text: exit ? "EXIT" : side || "TRADE",
+        };
+      }).sort((a, b) => a.time - b.time);
+      try { createSeriesMarkers(candleSeries, markers); } catch (_) {}
+    }
 
-  const entry =
-    numberValue(currentPosition?.average_price) ??
-    numberValue(analysis?.entry_price);
+    priceChart.timeScale().fitContent();
+    volumeChart.timeScale().fitContent();
 
-  const stopLoss =
-    numberValue(currentPosition?.stop_loss) ??
-    numberValue(analysis?.stop_loss);
+    let syncing = false;
+    const syncPrice = (range) => {
+      if (!range || syncing) return;
+      syncing = true;
+      volumeChart.timeScale().setVisibleLogicalRange(range);
+      syncing = false;
+    };
+    const syncVolume = (range) => {
+      if (!range || syncing) return;
+      syncing = true;
+      priceChart.timeScale().setVisibleLogicalRange(range);
+      syncing = false;
+    };
+    priceChart.timeScale().subscribeVisibleLogicalRangeChange(syncPrice);
+    volumeChart.timeScale().subscribeVisibleLogicalRangeChange(syncVolume);
 
-  const target1 =
-    numberValue(currentPosition?.exit_target) ??
-    numberValue(analysis?.target_1) ??
-    numberValue(analysis?.target1);
+    const resize = () => {
+      if (priceRef.current) priceChart.applyOptions({ width: priceRef.current.clientWidth });
+      if (volumeRef.current) volumeChart.applyOptions({ width: volumeRef.current.clientWidth });
+    };
+    window.addEventListener("resize", resize);
 
-  const target2 =
-    numberValue(analysis?.target_2) ??
-    numberValue(analysis?.target2);
+    return () => {
+      window.removeEventListener("resize", resize);
+      priceChart.remove();
+      volumeChart.remove();
+    };
+  }, [rows, chartType, entry, stop, t1, t2, trades, selected]);
 
-  const support =
-    numberValue(analysis?.support) ??
-    numberValue(analysis?.chart_analysis?.support);
-
-  const resistance =
-    numberValue(analysis?.resistance) ??
-    numberValue(analysis?.chart_analysis?.resistance);
-
-  const signal = String(analysis?.signal || "NO TRADE").toUpperCase();
-  const qualified =
-    analysis?.qualified === true ||
-    analysis?.strict_qualified === true ||
-    analysis?.executable === true;
-
-  const chartDirection = String(
-    analysis?.chart_direction ??
-      analysis?.chart_analysis?.direction ??
-      "UNKNOWN"
-  ).toUpperCase();
-
-  const trend15m = String(
-    analysis?.trend_15m ??
-      analysis?.chart_analysis_15m?.direction ??
-      "UNKNOWN"
-  ).toUpperCase();
-
-  const patterns = normalizePatterns(analysis);
+  const patterns = patternsFrom(analysis);
   const reasons = Array.isArray(analysis?.reasons) ? analysis.reasons : [];
-  const warnings = Array.isArray(analysis?.warnings) ? analysis.warnings : [];
-
-  const tickEvery = Math.max(1, Math.ceil(chartData.length / 8));
-
-  const signalBackground =
-    signal === "BUY"
-      ? "#dcfce7"
-      : signal === "SELL"
-      ? "#fee2e2"
-      : signal === "WAIT"
-      ? "#fef3c7"
-      : "#f1f5f9";
-
-  const signalColor =
-    signal === "BUY"
-      ? "#166534"
-      : signal === "SELL"
-      ? "#991b1b"
-      : signal === "WAIT"
-      ? "#92400e"
-      : "#475569";
+  const signal = String(analysis?.signal || "NO TRADE").toUpperCase();
 
   return (
-    <div style={{ width: "100%" }}>
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-          gap: 10,
-          marginBottom: 12,
-        }}
-      >
-        <div
-          style={{
-            padding: 12,
-            border: "1px solid #e2e8f0",
-            borderRadius: 10,
-            background: "#ffffff",
-          }}
-        >
-          <div style={{ fontSize: 12, color: "#64748b" }}>
-            {selectedSymbol || "Stock"} • {interval}
-          </div>
-          <div style={{ fontSize: 22, fontWeight: 900, marginTop: 3 }}>
-            {money(currentPrice)}
-          </div>
-          <div
-            style={{
-              fontSize: 12,
-              fontWeight: 800,
-              color:
-                candleChange === null
-                  ? "#64748b"
-                  : candleChange >= 0
-                  ? "#16a34a"
-                  : "#dc2626",
-            }}
-          >
-            {candleChange === null
-              ? "Latest candle"
-              : `${candleChange >= 0 ? "+" : ""}${candleChange.toFixed(
-                  2
-                )}% vs previous candle`}
-          </div>
+    <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, overflow: "hidden" }}>
+      <div style={{ padding: "16px 18px", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16, flexWrap: "wrap", borderBottom: "1px solid #e5e7eb" }}>
+        <div>
+          <div style={{ fontSize: 20, fontWeight: 800, color: "#172b4d" }}>{selected || "Selected Stock"}</div>
+          <div style={{ color: "#667085", fontSize: 12, marginTop: 3 }}>NSE • Intraday • {interval} • Candles</div>
         </div>
-
-        <div
-          style={{
-            padding: 12,
-            border: "1px solid #e2e8f0",
-            borderRadius: 10,
-            background: live ? "#f0fdf4" : "#f8fafc",
-          }}
-        >
-          <div style={{ fontSize: 12, color: "#64748b" }}>Live Status</div>
-          <div
-            style={{
-              fontSize: 17,
-              fontWeight: 900,
-              marginTop: 5,
-              color: live ? "#16a34a" : "#64748b",
-            }}
-          >
-            {live ? "● LIVE CANDLES" : "MARKET CLOSED"}
-          </div>
-          <div style={{ fontSize: 11, color: "#64748b", marginTop: 3 }}>
-            Selected stock refresh: ~15 sec
-          </div>
-        </div>
-
-        <div
-          style={{
-            padding: 12,
-            border: "1px solid #e2e8f0",
-            borderRadius: 10,
-            background: signalBackground,
-          }}
-        >
-          <div style={{ fontSize: 12, color: "#64748b" }}>
-            Trade Suggestion
-          </div>
-          <div
-            style={{
-              fontSize: 18,
-              fontWeight: 900,
-              marginTop: 5,
-              color: signalColor,
-            }}
-          >
-            {qualified && ["BUY", "SELL"].includes(signal)
-              ? `QUALIFIED ${signal}`
-              : signal}
-          </div>
-          <div style={{ fontSize: 11, color: "#64748b", marginTop: 3 }}>
-            Score {analysis?.score ?? "—"} • R:R{" "}
-            {numberValue(analysis?.risk_reward) !== null
-              ? `1:${Number(analysis.risk_reward).toFixed(2)}`
-              : "—"}
-          </div>
-        </div>
-
-        <div
-          style={{
-            padding: 12,
-            border: "1px solid #e2e8f0",
-            borderRadius: 10,
-            background: "#ffffff",
-          }}
-        >
-          <div style={{ fontSize: 12, color: "#64748b" }}>Chart Context</div>
-          <div style={{ marginTop: 5, fontSize: 13, fontWeight: 800 }}>
-            5m: {chartDirection}
-          </div>
-          <div style={{ marginTop: 3, fontSize: 13, fontWeight: 800 }}>
-            15m: {trend15m}
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 26, fontWeight: 800, color: "#172b4d" }}>{money(currentPrice)}</div>
+          <div style={{ marginTop: 3, fontSize: 12, fontWeight: 700, color: change === null || change >= 0 ? GREEN : RED }}>
+            {change === null ? "Latest price" : `${change >= 0 ? "+" : ""}${money(change)} (${changePct >= 0 ? "+" : ""}${changePct.toFixed(2)}%)`}
+            <span style={{ marginLeft: 12, color: live ? GREEN : "#667085" }}>{live ? "● LIVE" : "Market closed"}</span>
           </div>
         </div>
       </div>
 
-      <div
-        style={{
-          width: "100%",
-          height: 520,
-          background: "#ffffff",
-          border: "1px solid #e2e8f0",
-          borderRadius: 10,
-          padding: "10px 6px 4px 0",
-          boxSizing: "border-box",
-        }}
-      >
-        <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart
-            data={chartData}
-            barCategoryGap="18%"
-            margin={{
-              top: 22,
-              right: 18,
-              bottom: 12,
-              left: 8,
-            }}
-          >
-            <CartesianGrid stroke="#edf1f5" strokeDasharray="3 3" />
-
-            <XAxis
-              dataKey="label"
-              minTickGap={20}
-              interval={tickEvery - 1}
-              tick={{
-                fontSize: 11,
-                fill: "#64748b",
-              }}
-            />
-
-            <YAxis
-              domain={domain}
-              orientation="right"
-              width={88}
-              tick={{
-                fontSize: 11,
-                fill: "#64748b",
-              }}
-              tickFormatter={(value) =>
-                `₹${Number(value).toLocaleString("en-IN", {
-                  maximumFractionDigits: 2,
-                })}`
-              }
-            />
-
-            <Tooltip content={<ChartTooltip />} />
-
-            {chartType === "CANDLE" ? (
-              <Bar
-                dataKey="candleRange"
-                shape={(props) => <CandleShape {...props} />}
-                isAnimationActive={false}
-              />
-            ) : (
-              <Line
-                type="monotone"
-                dataKey="close"
-                stroke="#2563eb"
-                strokeWidth={2}
-                dot={false}
-                isAnimationActive={false}
-              />
-            )}
-
-            <Line
-              type="monotone"
-              dataKey="vwap"
-              stroke="#7c3aed"
-              strokeWidth={1.5}
-              strokeDasharray="5 3"
-              dot={false}
-              connectNulls
-              isAnimationActive={false}
-            />
-
-            <Line
-              type="monotone"
-              dataKey="ema9"
-              stroke="#0f766e"
-              strokeWidth={1.2}
-              dot={false}
-              connectNulls
-              isAnimationActive={false}
-            />
-
-            <Line
-              type="monotone"
-              dataKey="ema20"
-              stroke="#c2410c"
-              strokeWidth={1.2}
-              dot={false}
-              connectNulls
-              isAnimationActive={false}
-            />
-
-            {Number.isFinite(currentPrice) && (
-              <ReferenceLine
-                y={currentPrice}
-                stroke="#2563eb"
-                strokeWidth={1.5}
-                strokeDasharray="4 3"
-                label={
-                  <LevelLabel
-                    text={`LIVE ${money(currentPrice)}`}
-                    fill="#2563eb"
-                  />
-                }
-              />
-            )}
-
-            {Number.isFinite(entry) && (
-              <ReferenceLine
-                y={entry}
-                stroke="#0284c7"
-                strokeWidth={1.4}
-                strokeDasharray="6 3"
-                label={
-                  <LevelLabel
-                    text={`ENTRY ${money(entry)}`}
-                    fill="#0284c7"
-                  />
-                }
-              />
-            )}
-
-            {Number.isFinite(stopLoss) && (
-              <ReferenceLine
-                y={stopLoss}
-                stroke="#dc2626"
-                strokeWidth={1.5}
-                strokeDasharray="6 3"
-                label={
-                  <LevelLabel
-                    text={`SL ${money(stopLoss)}`}
-                    fill="#dc2626"
-                  />
-                }
-              />
-            )}
-
-            {Number.isFinite(target1) && (
-              <ReferenceLine
-                y={target1}
-                stroke="#16a34a"
-                strokeWidth={1.4}
-                strokeDasharray="6 3"
-                label={
-                  <LevelLabel
-                    text={`T1 ${money(target1)}`}
-                    fill="#16a34a"
-                  />
-                }
-              />
-            )}
-
-            {Number.isFinite(target2) && (
-              <ReferenceLine
-                y={target2}
-                stroke="#15803d"
-                strokeWidth={1.4}
-                strokeDasharray="3 3"
-                label={
-                  <LevelLabel
-                    text={`T2 ${money(target2)}`}
-                    fill="#15803d"
-                  />
-                }
-              />
-            )}
-
-            {Number.isFinite(support) && (
-              <ReferenceLine
-                y={support}
-                stroke="#0891b2"
-                strokeWidth={1}
-                strokeDasharray="2 4"
-              />
-            )}
-
-            {Number.isFinite(resistance) && (
-              <ReferenceLine
-                y={resistance}
-                stroke="#be123c"
-                strokeWidth={1}
-                strokeDasharray="2 4"
-              />
-            )}
-
-            {selectedTrades.map((trade, index) => {
-              const price = numberValue(trade?.price);
-              const label = findNearestLabel(chartData, trade?.timestamp);
-
-              if (price === null || !label) return null;
-
-              const side = String(trade?.side || "").toUpperCase();
-              const action = String(trade?.action || "").toUpperCase();
-              const isExit =
-                action.includes("CLOSE") ||
-                action.includes("EXIT") ||
-                action.includes("TARGET") ||
-                action.includes("STOP");
-
-              const markerText = isExit
-                ? `EXIT ${money(price)}`
-                : `${side || "TRADE"} ${money(price)}`;
-
-              const markerColor = isExit
-                ? "#f97316"
-                : side === "BUY"
-                ? "#16a34a"
-                : "#dc2626";
-
-              return (
-                <ReferenceDot
-                  key={trade?.id || `${label}-${price}-${index}`}
-                  x={label}
-                  y={price}
-                  r={5}
-                  fill={markerColor}
-                  stroke="#ffffff"
-                  strokeWidth={2}
-                  ifOverflow="extendDomain"
-                  label={
-                    <MarkerLabel
-                      text={markerText}
-                      fill={markerColor}
-                    />
-                  }
-                />
-              );
-            })}
-          </ComposedChart>
-        </ResponsiveContainer>
+      <div style={{ padding: "9px 18px", display: "flex", gap: 18, flexWrap: "wrap", borderBottom: "1px solid #e5e7eb", fontSize: 12, fontWeight: 700 }}>
+        <span style={{ color: ORANGE }}>— EMA 9</span>
+        <span style={{ color: BLUE }}>— EMA 20</span>
+        <span style={{ color: PURPLE }}>--- VWAP</span>
+        <span>Entry {money(entry)}</span>
+        <span style={{ color: RED }}>SL {money(stop)}</span>
+        <span style={{ color: GREEN }}>T1 {money(t1)}</span>
+        <span style={{ color: "#15803d" }}>T2 {money(t2)}</span>
       </div>
 
-      <div
-        style={{
-          width: "100%",
-          height: 115,
-          marginTop: 8,
-          background: "#ffffff",
-          border: "1px solid #e2e8f0",
-          borderRadius: 10,
-          padding: "4px 6px 0 0",
-          boxSizing: "border-box",
-        }}
-      >
-        <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart
-            data={chartData}
-            barCategoryGap="18%"
-            margin={{ top: 6, right: 88, bottom: 5, left: 8 }}
-          >
-            <CartesianGrid vertical={false} stroke="#edf1f5" />
-            <XAxis dataKey="label" hide />
-            <YAxis
-              orientation="right"
-              width={70}
-              axisLine={false}
-              tickLine={false}
-              tick={{ fontSize: 9, fill: "#64748b" }}
-              tickFormatter={(value) =>
-                Number(value).toLocaleString("en-IN", { notation: "compact" })
-              }
-            />
-            <Tooltip
-              formatter={(value) => [
-                Number(value).toLocaleString("en-IN"),
-                "Volume",
-              ]}
-            />
-            <Bar dataKey="volume" isAnimationActive={false}>
-              {chartData.map((row, index) => (
-                <Cell
-                  key={`volume-${index}`}
-                  fill={row.close >= row.open ? "#00b386" : "#eb5b3c"}
-                  fillOpacity={0.72}
-                />
-              ))}
-            </Bar>
-          </ComposedChart>
-        </ResponsiveContainer>
-      </div>
+      <div ref={priceRef} style={{ width: "100%", height: 470 }} />
+      <div style={{ padding: "6px 16px 0", fontSize: 12, fontWeight: 800, color: "#344054", borderTop: "1px solid #f0f2f5" }}>Volume</div>
+      <div ref={volumeRef} style={{ width: "100%", height: 115 }} />
 
-      <div
-        style={{
-          display: "flex",
-          flexWrap: "wrap",
-          gap: 12,
-          marginTop: 9,
-          fontSize: 12,
-          color: "#475569",
-        }}
-      >
-        <span><strong style={{ color: "#7c3aed" }}>— —</strong> VWAP</span>
-        <span><strong style={{ color: "#0f766e" }}>——</strong> EMA 9</span>
-        <span><strong style={{ color: "#c2410c" }}>——</strong> EMA 20</span>
-        <span><strong style={{ color: "#0891b2" }}>···</strong> Support {money(support)}</span>
-        <span><strong style={{ color: "#be123c" }}>···</strong> Resistance {money(resistance)}</span>
-      </div>
-
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
-          gap: 12,
-          marginTop: 14,
-        }}
-      >
-        <div
-          style={{
-            border: "1px solid #e2e8f0",
-            borderRadius: 10,
-            padding: 14,
-            background: "#ffffff",
-          }}
-        >
-          <div style={{ fontWeight: 900, marginBottom: 10 }}>
-            Candle Pattern Analysis
-          </div>
-
-          {patterns.length ? (
-            patterns.map((pattern, index) => {
-              const direction = pattern.direction;
-              const color =
-                direction === "BULLISH"
-                  ? "#16a34a"
-                  : direction === "BEARISH"
-                  ? "#dc2626"
-                  : "#64748b";
-
-              return (
-                <div
-                  key={`${pattern.name}-${index}`}
-                  style={{
-                    padding: "8px 10px",
-                    borderRadius: 8,
-                    background: "#f8fafc",
-                    marginBottom: 7,
-                  }}
-                >
-                  <strong style={{ color }}>{pattern.name}</strong>
-                  <span style={{ color: "#64748b" }}>
-                    {" "}
-                    • {direction}
-                    {pattern.strength !== null
-                      ? ` • Strength ${pattern.strength}`
-                      : ""}
-                  </span>
-                </div>
-              );
-            })
-          ) : (
-            <div style={{ color: "#64748b", fontSize: 13 }}>
-              No strong candlestick pattern detected on the latest analysis.
-            </div>
-          )}
-
-          <div style={{ marginTop: 10, fontSize: 13, lineHeight: 1.65 }}>
-            <div><strong>5m direction:</strong> {chartDirection}</div>
-            <div><strong>15m direction:</strong> {trend15m}</div>
-            <div>
-              <strong>Structure:</strong>{" "}
-              {analysis?.chart_analysis?.structure || "—"}
-            </div>
-            <div>
-              <strong>Breakout:</strong>{" "}
-              {analysis?.chart_analysis?.breakout || analysis?.breakout || "—"}
-            </div>
+      <div style={{ padding: 16, background: "#fafbfc", display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 12 }}>
+        <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 12, padding: 15 }}>
+          <div style={{ fontWeight: 800, marginBottom: 10 }}>Technical setup</div>
+          <div style={{ lineHeight: 1.8, fontSize: 13 }}>
+            <div><b>Candle pattern:</b> {patterns.length ? patterns.map((p) => p?.name || p).join(", ") : "No strong pattern"}</div>
+            <div><b>5m trend:</b> {String(analysis?.chart_direction ?? analysis?.chart_analysis?.direction ?? "—").toUpperCase()}</div>
+            <div><b>15m trend:</b> {String(analysis?.trend_15m ?? analysis?.chart_analysis_15m?.direction ?? "—").toUpperCase()}</div>
+            <div><b>Structure:</b> {analysis?.chart_analysis?.structure || "—"}</div>
+            <div><b>VWAP:</b> {money(analysis?.vwap)}</div>
+            <div><b>EMA 9:</b> {money(analysis?.ema9)}</div>
+            <div><b>EMA 20:</b> {money(analysis?.ema20)}</div>
           </div>
         </div>
 
-        <div
-          style={{
-            border: "1px solid #e2e8f0",
-            borderRadius: 10,
-            padding: 14,
-            background: signalBackground,
-          }}
-        >
-          <div style={{ fontWeight: 900, marginBottom: 10, color: signalColor }}>
-            Why {selectedSymbol || "this stock"} is{" "}
-            {qualified && ["BUY", "SELL"].includes(signal)
-              ? `a QUALIFIED ${signal}`
-              : signal}
+        <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 12, padding: 15 }}>
+          <div style={{ fontWeight: 800 }}>Trade suggestion</div>
+          <div style={{ display: "inline-block", marginTop: 10, padding: "7px 12px", borderRadius: 7, fontWeight: 900, color: signal === "BUY" ? GREEN : signal === "SELL" ? RED : "#667085", background: signal === "BUY" ? "#e8f8f3" : signal === "SELL" ? "#fff0ed" : "#f2f4f7" }}>{signal}</div>
+          <div style={{ marginTop: 12, lineHeight: 1.8, fontSize: 13 }}>
+            <div><b>Entry:</b> {money(entry)}</div><div><b>Stop loss:</b> {money(stop)}</div><div><b>Target 1:</b> {money(t1)}</div><div><b>Target 2:</b> {money(t2)}</div>
           </div>
-
-          {reasons.length ? (
-            <ul
-              style={{
-                margin: 0,
-                paddingLeft: 20,
-                lineHeight: 1.75,
-                color: "#334155",
-                fontSize: 13,
-              }}
-            >
-              {reasons.map((reason, index) => (
-                <li key={`${reason}-${index}`}>{reason}</li>
-              ))}
-            </ul>
-          ) : (
-            <div style={{ color: "#64748b", fontSize: 13 }}>
-              No analysis reasons were returned by the backend.
-            </div>
-          )}
-
-          {warnings.length > 0 && (
-            <div
-              style={{
-                marginTop: 12,
-                paddingTop: 10,
-                borderTop: "1px solid rgba(100,116,139,0.25)",
-                fontSize: 12,
-                color: "#92400e",
-              }}
-            >
-              <strong>Warnings:</strong> {warnings.join(" • ")}
-            </div>
-          )}
+          <div style={{ marginTop: 12, fontWeight: 800, fontSize: 13 }}>Why this setup?</div>
+          {reasons.length ? <ul style={{ margin: "7px 0 0", paddingLeft: 20, lineHeight: 1.7, fontSize: 12, color: "#475467" }}>{reasons.map((r, i) => <li key={i}>{r}</li>)}</ul> : <div style={{ marginTop: 7, fontSize: 12, color: "#667085" }}>No setup reasons returned by the backend.</div>}
         </div>
       </div>
     </div>

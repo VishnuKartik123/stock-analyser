@@ -509,9 +509,9 @@ intraday_paper_trades = load_intraday_trade_history()
 # ============================================================
 
 MAX_QUALIFIED_SUGGESTIONS_PER_DAY = 3
-QUALIFIED_MIN_SCORE = 6
-QUALIFIED_MIN_RISK_REWARD = 1.50
-QUALIFIED_MIN_VOLUME_RATIO = 0.80
+QUALIFIED_MIN_SCORE = 7
+QUALIFIED_MIN_RISK_REWARD = 1.80
+QUALIFIED_MIN_VOLUME_RATIO = 1.00
 
 LATE_SESSION_START_MINUTES = 14 * 60 + 45
 NEW_ENTRY_CUTOFF_MINUTES = 15 * 60 + 15
@@ -780,6 +780,13 @@ def is_qualified_setup(result):
         )
     )
 
+    chart_direction = str(result.get("chart_direction") or "NEUTRAL").upper()
+    trend_15m = str(result.get("trend_15m") or "UNKNOWN").upper()
+    chart_ok = (signal == "BUY" and chart_direction == "BULLISH") or (signal == "SELL" and chart_direction == "BEARISH")
+    mtf_ok = (signal == "BUY" and trend_15m == "BULLISH") or (signal == "SELL" and trend_15m == "BEARISH")
+    loss_controls = today_intraday_loss_controls()
+    cooldown_ok = clean_symbol(result.get("symbol", "")) not in loss_controls["losing_symbols"]
+
     checks = {
         "market_settled": not settling and minutes >= MARKET_SETTLED_MINUTES,
         "market_open": get_market_status() == "OPEN",
@@ -791,6 +798,10 @@ def is_qualified_setup(result):
         "margin": bool(result.get("margin_band_eligible")),
         "valid_trade_levels": valid_levels,
         "historical_filter": historical_ok,
+        "chart_confirmation": chart_ok,
+        "multi_timeframe_confirmation": mtf_ok,
+        "same_symbol_loss_cooldown": cooldown_ok,
+        "daily_loss_circuit_breaker": not loss_controls["circuit_breaker"],
     }
 
     executable_checks = {
@@ -804,6 +815,10 @@ def is_qualified_setup(result):
         "margin": checks["margin"],
         "valid_trade_levels": valid_levels,
         "historical_filter": historical_ok,
+        "chart_confirmation": chart_ok,
+        "multi_timeframe_confirmation": mtf_ok,
+        "same_symbol_loss_cooldown": cooldown_ok,
+        "daily_loss_circuit_breaker": not loss_controls["circuit_breaker"],
     }
 
     strict_qualified = all(checks.values())
@@ -821,6 +836,8 @@ def is_qualified_setup(result):
         else "NO_NEW_ENTRIES"
     )
     result["historical_observation"] = historical
+    result["loss_controls"] = loss_controls
+    result["defensive_mode"] = bool(loss_controls["circuit_breaker"] or (historical.get("sample_size", 0) >= 10 and (historical.get("success_rate") or 0) < 0.30))
     result["qualification_thresholds"] = {
         "min_score": min_score,
         "min_risk_reward": min_rr,
@@ -1879,6 +1896,129 @@ def get_market_status():
 
 
 # ============================================================
+# PRICE ACTION / CANDLESTICK / CHART PATTERN ANALYSIS
+# ============================================================
+
+def _candle_parts(row):
+    o = safe_float(row.get("Open")); h = safe_float(row.get("High"))
+    l = safe_float(row.get("Low")); c = safe_float(row.get("Close"))
+    if None in (o, h, l, c):
+        return None
+    rng = max(h - l, 1e-9)
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    return {"open": o, "high": h, "low": l, "close": c, "range": rng,
+            "body": body, "upper": upper, "lower": lower,
+            "bullish": c > o, "bearish": c < o}
+
+
+def detect_candlestick_patterns(df):
+    """Rule-based recognition. Patterns are context features, not guarantees."""
+    if df is None or len(df) < 3:
+        return []
+    a = _candle_parts(df.iloc[-3]); b = _candle_parts(df.iloc[-2]); c = _candle_parts(df.iloc[-1])
+    if not a or not b or not c:
+        return []
+    out = []
+    def add(name, direction, strength):
+        out.append({"name": name, "direction": direction, "strength": strength})
+
+    # Single-candle patterns
+    if c["body"] <= 0.10 * c["range"]:
+        add("DOJI", "NEUTRAL", 1)
+    elif c["body"] <= 0.30 * c["range"]:
+        add("SPINNING_TOP", "NEUTRAL", 1)
+    if c["lower"] >= 2.0 * max(c["body"], 1e-9) and c["upper"] <= 0.35 * c["range"]:
+        add("HAMMER", "BULLISH", 2)
+    if c["upper"] >= 2.0 * max(c["body"], 1e-9) and c["lower"] <= 0.35 * c["range"]:
+        add("SHOOTING_STAR", "BEARISH", 2)
+
+    # Two-candle engulfing
+    if b["bearish"] and c["bullish"] and c["open"] <= b["close"] and c["close"] >= b["open"]:
+        add("BULLISH_ENGULFING", "BULLISH", 3)
+    if b["bullish"] and c["bearish"] and c["open"] >= b["close"] and c["close"] <= b["open"]:
+        add("BEARISH_ENGULFING", "BEARISH", 3)
+
+    # Three-candle reversal approximations
+    a_mid = (a["open"] + a["close"]) / 2.0
+    if a["bearish"] and b["body"] <= 0.45*b["range"] and c["bullish"] and c["close"] > a_mid:
+        add("MORNING_STAR", "BULLISH", 3)
+    if a["bullish"] and b["body"] <= 0.45*b["range"] and c["bearish"] and c["close"] < a_mid:
+        add("EVENING_STAR", "BEARISH", 3)
+
+    last3 = [_candle_parts(df.iloc[-i]) for i in (3,2,1)]
+    if all(x and x["bullish"] for x in last3) and last3[0]["close"] < last3[1]["close"] < last3[2]["close"]:
+        add("THREE_WHITE_SOLDIERS", "BULLISH", 3)
+    if all(x and x["bearish"] for x in last3) and last3[0]["close"] > last3[1]["close"] > last3[2]["close"]:
+        add("THREE_BLACK_CROWS", "BEARISH", 3)
+    return out
+
+
+def analyze_market_structure(df):
+    if df is None or len(df) < 12:
+        return {"trend": "UNKNOWN", "structure": "INSUFFICIENT_DATA", "breakout": "NONE"}
+    w = df.tail(12)
+    highs = w["High"].astype(float); lows = w["Low"].astype(float); closes = w["Close"].astype(float)
+    # Compare recent 3-candle swing zones with the preceding 3-candle zones.
+    recent_h = highs.iloc[-3:].max(); prior_h = highs.iloc[-6:-3].max()
+    recent_l = lows.iloc[-3:].min(); prior_l = lows.iloc[-6:-3].min()
+    if recent_h > prior_h and recent_l > prior_l:
+        trend, structure = "BULLISH", "HIGHER_HIGH_HIGHER_LOW"
+    elif recent_h < prior_h and recent_l < prior_l:
+        trend, structure = "BEARISH", "LOWER_HIGH_LOWER_LOW"
+    else:
+        trend, structure = "SIDEWAYS", "MIXED_STRUCTURE"
+    prev_res = highs.iloc[-11:-1].max(); prev_sup = lows.iloc[-11:-1].min(); close = closes.iloc[-1]
+    breakout = "BULLISH" if close > prev_res else "BEARISH" if close < prev_sup else "NONE"
+    return {"trend": trend, "structure": structure, "breakout": breakout,
+            "recent_resistance": safe_float(prev_res), "recent_support": safe_float(prev_sup)}
+
+
+def resample_to_15m(df):
+    """Build 15m confirmation candles from 5m data without another Yahoo request."""
+    if df is None or df.empty:
+        return None
+    try:
+        out = df[["Open","High","Low","Close","Volume"]].resample("15min").agg({
+            "Open":"first", "High":"max", "Low":"min", "Close":"last", "Volume":"sum"
+        }).dropna(subset=["Open","High","Low","Close"])
+        return out
+    except Exception:
+        return None
+
+
+def build_chart_analysis(df, interval="5m"):
+    structure = analyze_market_structure(df)
+    candles = detect_candlestick_patterns(df)
+    bullish = sum(int(x["strength"]) for x in candles if x["direction"] == "BULLISH")
+    bearish = sum(int(x["strength"]) for x in candles if x["direction"] == "BEARISH")
+    if structure.get("trend") == "BULLISH": bullish += 2
+    elif structure.get("trend") == "BEARISH": bearish += 2
+    if structure.get("breakout") == "BULLISH": bullish += 2
+    elif structure.get("breakout") == "BEARISH": bearish += 2
+    direction = "BULLISH" if bullish >= bearish + 2 else "BEARISH" if bearish >= bullish + 2 else "NEUTRAL"
+    return {"interval": interval, "direction": direction, "bullish_points": bullish,
+            "bearish_points": bearish, "candlestick_patterns": candles, **structure}
+
+
+def today_intraday_loss_controls():
+    """Return completed-loss count and most recent losing symbols for defensive gating."""
+    day = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    trades = load_intraday_trade_history()
+    losses = []
+    for t in trades:
+        ts = str(t.get("timestamp") or "")
+        if not ts.startswith(day):
+            continue
+        pnl = safe_float(t.get("realized_pnl"))
+        action = str(t.get("action") or "").upper()
+        if action.startswith("CLOSE") and pnl is not None and pnl < 0:
+            losses.append((str(t.get("symbol") or "").upper(), ts, pnl))
+    return {"loss_count": len(losses), "circuit_breaker": len(losses) >= 2,
+            "losing_symbols": list(dict.fromkeys(x[0] for x in losses))}
+
+# ============================================================
 # INTRADAY SIGNAL ENGINE
 # ============================================================
 
@@ -1948,6 +2088,10 @@ def generate_intraday_signal(
     support, resistance = (
         get_support_resistance(df)
     )
+
+    chart_analysis = build_chart_analysis(df, "5m")
+    df15 = resample_to_15m(df)
+    chart_analysis_15m = build_chart_analysis(df15, "15m") if df15 is not None and len(df15) >= 12 else {"interval": "15m", "direction": "UNKNOWN", "candlestick_patterns": [], "trend": "UNKNOWN", "structure": "INSUFFICIENT_DATA", "breakout": "NONE"}
 
     score = 0
     reasons = []
@@ -2109,6 +2253,27 @@ def generate_intraday_signal(
             reasons.append(
                 "Price remains inside the opening range"
             )
+
+    # ========================================================
+    # PRICE ACTION / CANDLE / 15m CONFIRMATION
+    # ========================================================
+    if chart_analysis.get("direction") == "BULLISH":
+        score += 2
+        reasons.append("5m chart structure is bullish")
+    elif chart_analysis.get("direction") == "BEARISH":
+        score -= 2
+        reasons.append("5m chart structure is bearish")
+
+    if chart_analysis_15m.get("direction") == "BULLISH":
+        score += 2
+        reasons.append("15m price action confirms bullish direction")
+    elif chart_analysis_15m.get("direction") == "BEARISH":
+        score -= 2
+        reasons.append("15m price action confirms bearish direction")
+
+    candle_names = [x.get("name") for x in chart_analysis.get("candlestick_patterns", [])]
+    if candle_names:
+        reasons.append("Candles: " + ", ".join(candle_names))
 
     # ========================================================
     # DETERMINE SIGNAL
@@ -2594,6 +2759,11 @@ def generate_intraday_signal(
         },
 
         "breakout": breakout,
+        "chart_analysis": chart_analysis,
+        "chart_analysis_15m": chart_analysis_15m,
+        "candle_patterns": [x.get("name") for x in chart_analysis.get("candlestick_patterns", [])],
+        "chart_direction": chart_analysis.get("direction"),
+        "trend_15m": chart_analysis_15m.get("direction"),
 
         "reasons": reasons,
 
@@ -3083,7 +3253,8 @@ def intraday_scanner(
     # Try to provide at least two valid setups for the day, but never manufacture
     # a WAIT/NO TRADE signal and never exceed the daily maximum.
     qualified_today_now = scanner_signal_count_today()
-    fallback_needed = max(0, min(2 - qualified_today_now, slots))
+    loss_controls_now = today_intraday_loss_controls()
+    fallback_needed = 0 if loss_controls_now["circuit_breaker"] else max(0, min(2 - qualified_today_now, slots))
 
     if fallback_needed > 0:
         fallback_candidates = [

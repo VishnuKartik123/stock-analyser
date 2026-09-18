@@ -101,6 +101,7 @@ export default function IntradayChart({
   const [showEma9, setShowEma9] = useState(true);
   const [showEma20, setShowEma20] = useState(true);
   const [hoveredCandle, setHoveredCandle] = useState(null);
+  const [selectedCandle, setSelectedCandle] = useState(null);
 
   const rows = useMemo(() => {
     const source = Array.isArray(data) ? data : [];
@@ -182,7 +183,7 @@ export default function IntradayChart({
       ? (change / previous.close) * 100
       : null;
 
-  const displayCandle = hoveredCandle || latest || null;
+  const displayCandle = selectedCandle || hoveredCandle || latest || null;
 
   useEffect(() => {
     if (!priceRef.current || !volumeRef.current || !rows.length) return;
@@ -409,6 +410,26 @@ export default function IntradayChart({
 
     priceChart.subscribeCrosshairMove(crosshairHandler);
 
+    // Clicking a candle locks its OHLC/volume/indicator values in the
+    // information bar until another candle is clicked.
+    const clickHandler = (param) => {
+      if (!param?.time) return;
+
+      const key =
+        typeof param.time === "number"
+          ? Number(param.time)
+          : null;
+
+      if (key !== null && rowByTime.has(key)) {
+        setSelectedCandle(rowByTime.get(key));
+      }
+    };
+
+    priceChart.subscribeClick(clickHandler);
+
+    // Keep the entire returned market session visible from the first candle
+    // to the final candle. For a 1-day request this means market open through
+    // market close (or the latest candle while the market is still open).
     priceChart.timeScale().fitContent();
     volumeChart.timeScale().fitContent();
 
@@ -464,6 +485,7 @@ export default function IntradayChart({
       window.removeEventListener("resize", resize);
       try {
         priceChart.unsubscribeCrosshairMove(crosshairHandler);
+        priceChart.unsubscribeClick(clickHandler);
       } catch (_) {}
       priceChart.remove();
       volumeChart.remove();
@@ -634,12 +656,35 @@ export default function IntradayChart({
         }}
       >
         <strong style={{ color: "#344054" }}>
-          {hoveredCandle ? "Cursor candle" : "Latest candle"}
+          {selectedCandle
+            ? "Selected candle"
+            : hoveredCandle
+              ? "Cursor candle"
+              : "Latest candle"}
         </strong>
 
         <span style={{ color: "#667085" }}>
           {displayCandle ? formatCandleTime(displayCandle.time) : "—"}
         </span>
+
+        {selectedCandle && (
+          <button
+            type="button"
+            onClick={() => setSelectedCandle(null)}
+            style={{
+              padding: "3px 8px",
+              borderRadius: 6,
+              border: "1px solid #d0d5dd",
+              background: "#ffffff",
+              color: "#667085",
+              fontSize: 11,
+              fontWeight: 700,
+              cursor: "pointer",
+            }}
+          >
+            Clear
+          </button>
+        )}
 
         <span>
           O <b>{money(displayCandle?.open)}</b>

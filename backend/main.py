@@ -2002,6 +2002,125 @@ def build_chart_analysis(df, interval="5m"):
             "bearish_points": bearish, "candlestick_patterns": candles, **structure}
 
 
+def _is_current_intraday_candle(index_value, interval="5m"):
+    """True when index_value belongs to the still-forming NSE candle."""
+    if get_market_status() != "OPEN":
+        return False
+    try:
+        ts = pd.Timestamp(index_value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Asia/Kolkata")
+        else:
+            ts = ts.tz_convert("Asia/Kolkata")
+
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        minutes = 15 if str(interval).lower() == "15m" else 5
+        candle_start_minute = (now.minute // minutes) * minutes
+        current_start = now.replace(
+            minute=candle_start_minute, second=0, microsecond=0
+        )
+        return ts >= current_start
+    except Exception:
+        return False
+
+
+def scan_historical_candlestick_patterns(df, interval="5m"):
+    """
+    Scan every candle, not only the latest one.
+
+    `technical_executable` is a historical/chart-context label only. It does
+    not mean an order was or should have been placed. Live order eligibility
+    continues to use is_qualified_setup(), which includes session/risk gates.
+    """
+    if df is None or df.empty or len(df) < 3:
+        return {}
+
+    results = {}
+    total = len(df)
+
+    for i in range(2, total):
+        window = df.iloc[max(0, i - 2): i + 1]
+        patterns = detect_candlestick_patterns(window)
+        if not patterns:
+            continue
+
+        row = df.iloc[i]
+        close = safe_float(row.get("Close"))
+        ema9 = safe_float(row.get("EMA9"))
+        ema20 = safe_float(row.get("EMA20"))
+        vwap = safe_float(row.get("VWAP"))
+        volume_ratio = safe_float(row.get("VOLUME_RATIO"))
+
+        is_forming = i == total - 1 and _is_current_intraday_candle(
+            df.index[i], interval
+        )
+        status = "FORMING" if is_forming else "CONFIRMED"
+
+        enriched = []
+        for pattern in patterns:
+            direction = str(pattern.get("direction") or "NEUTRAL").upper()
+            checks = {
+                "ema_alignment": False,
+                "vwap_alignment": False,
+                "volume_confirmation": (
+                    volume_ratio is not None and volume_ratio >= 0.80
+                ),
+            }
+
+            if direction == "BULLISH":
+                checks["ema_alignment"] = (
+                    close is not None and ema9 is not None and ema20 is not None
+                    and close >= ema9 >= ema20
+                )
+                checks["vwap_alignment"] = (
+                    close is not None and vwap is not None and close >= vwap
+                )
+            elif direction == "BEARISH":
+                checks["ema_alignment"] = (
+                    close is not None and ema9 is not None and ema20 is not None
+                    and close <= ema9 <= ema20
+                )
+                checks["vwap_alignment"] = (
+                    close is not None and vwap is not None and close <= vwap
+                )
+
+            passed = sum(bool(v) for v in checks.values())
+            technical_executable = (
+                status == "CONFIRMED"
+                and direction in ("BULLISH", "BEARISH")
+                and passed >= 2
+            )
+
+            reasons = []
+            if status == "FORMING":
+                reasons.append("Pattern is still forming; wait for candle close")
+            if checks["ema_alignment"]:
+                reasons.append("EMA 9 / EMA 20 alignment supports the pattern")
+            else:
+                reasons.append("EMA alignment does not confirm the pattern")
+            if checks["vwap_alignment"]:
+                reasons.append("Price is on the confirming side of VWAP")
+            else:
+                reasons.append("VWAP does not confirm the pattern")
+            if checks["volume_confirmation"]:
+                reasons.append("Volume ratio confirms participation")
+            else:
+                reasons.append("Volume confirmation is weak")
+
+            enriched.append({
+                **pattern,
+                "status": status,
+                "technical_executable": technical_executable,
+                "confirmation_score": passed,
+                "confirmation_checks": checks,
+                "reasons": reasons,
+            })
+
+        results[df.index[i]] = enriched
+
+    return results
+
+
 def today_intraday_loss_controls():
     """Return completed-loss count and most recent losing symbols for defensive gating."""
     day = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
@@ -2784,12 +2903,14 @@ def generate_intraday_signal(
 # INTRADAY DATA CONVERTER
 # ============================================================
 
-def intraday_dataframe_to_records(df):
+def intraday_dataframe_to_records(df, interval="5m"):
 
     records = []
 
     if df is None or df.empty:
         return records
+
+    historical_patterns = scan_historical_candlestick_patterns(df, interval)
 
     for index, row in df.iterrows():
 
@@ -2801,60 +2922,39 @@ def intraday_dataframe_to_records(df):
         ):
             timestamp = timestamp.isoformat()
 
+        candle_patterns = historical_patterns.get(index, [])
+
         records.append({
 
             "time": timestamp,
 
-            "open": safe_float(
-                row.get("Open")
-            ),
+            "open": safe_float(row.get("Open")),
+            "high": safe_float(row.get("High")),
+            "low": safe_float(row.get("Low")),
+            "close": safe_float(row.get("Close")),
+            "volume": safe_float(row.get("Volume")),
 
-            "high": safe_float(
-                row.get("High")
-            ),
+            "vwap": safe_float(row.get("VWAP")),
+            "ema9": safe_float(row.get("EMA9")),
+            "ema20": safe_float(row.get("EMA20")),
+            "rsi14": safe_float(row.get("RSI14")),
+            "macd": safe_float(row.get("MACD")),
+            "macd_signal": safe_float(row.get("MACD_SIGNAL")),
+            "atr14": safe_float(row.get("ATR14")),
+            "volume_ratio": safe_float(row.get("VOLUME_RATIO")),
 
-            "low": safe_float(
-                row.get("Low")
+            # Historical + live candle-pattern analysis for this exact candle.
+            "patterns": candle_patterns,
+            "pattern_names": [p.get("name") for p in candle_patterns],
+            "pattern_status": (
+                "FORMING"
+                if any(p.get("status") == "FORMING" for p in candle_patterns)
+                else "CONFIRMED"
+                if candle_patterns
+                else None
             ),
-
-            "close": safe_float(
-                row.get("Close")
-            ),
-
-            "volume": safe_float(
-                row.get("Volume")
-            ),
-
-            "vwap": safe_float(
-                row.get("VWAP")
-            ),
-
-            "ema9": safe_float(
-                row.get("EMA9")
-            ),
-
-            "ema20": safe_float(
-                row.get("EMA20")
-            ),
-
-            "rsi14": safe_float(
-                row.get("RSI14")
-            ),
-
-            "macd": safe_float(
-                row.get("MACD")
-            ),
-
-            "macd_signal": safe_float(
-                row.get("MACD_SIGNAL")
-            ),
-
-            "atr14": safe_float(
-                row.get("ATR14")
-            ),
-
-            "volume_ratio": safe_float(
-                row.get("VOLUME_RATIO")
+            "pattern_technical_executable": any(
+                p.get("technical_executable") is True for p in candle_patterns
             ),
         })
 
@@ -2911,7 +3011,8 @@ def stock_intraday(
 
             "data":
                 intraday_dataframe_to_records(
-                    df
+                    df,
+                    interval
                 ),
 
             "signal": signal["signal"],
@@ -2975,6 +3076,32 @@ def intraday_analysis(
             risk_percent
         )
 
+        # Evaluate whether the LIVE setup is actually executable using the
+        # same session, score, RR, volume, margin, trend and risk gates used
+        # by the scanner. Pattern detection by itself never executes a trade.
+        qualified, setup_quality, qualification_checks = is_qualified_setup(result)
+        result["qualified"] = bool(qualified)
+        result["setup_quality"] = setup_quality
+        result["qualification_checks"] = qualification_checks
+
+        latest_patterns = result.get("chart_analysis", {}).get(
+            "candlestick_patterns", []
+        )
+        live_forming = _is_current_intraday_candle(df.index[-1], interval)
+        result["live_pattern_analysis"] = {
+            "status": "FORMING" if live_forming else "CONFIRMED",
+            "patterns": latest_patterns,
+            "executable": bool(result.get("executable")) and not live_forming,
+            "strict_qualified": bool(result.get("strict_qualified")) and not live_forming,
+            "message": (
+                "Wait for the current candle to close before treating the pattern as confirmed."
+                if live_forming and latest_patterns
+                else "Pattern is confirmed; execution still depends on all strategy gates."
+                if latest_patterns
+                else "No strong candle pattern on the latest candle."
+            ),
+        }
+
         return result
 
     except Exception as error:
@@ -3036,7 +3163,7 @@ def intraday_history(
             "symbol": clean,
             "interval": interval,
             "period": period,
-            "data": intraday_dataframe_to_records(df),
+            "data": intraday_dataframe_to_records(df, interval),
         }
 
     except Exception as error:

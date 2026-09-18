@@ -410,6 +410,7 @@ export default function App() {
   const [dayTradePendingOrders, setDayTradePendingOrders] = useState([]);
   const [dayTradeMessage, setDayTradeMessage] = useState("");
   const [dayTradeTargetInputs, setDayTradeTargetInputs] = useState({});
+  const [dayTradeStopLossInputs, setDayTradeStopLossInputs] = useState({});
 
   const [orderMessage, setOrderMessage] = useState("");
 
@@ -1382,6 +1383,86 @@ export default function App() {
       console.error("Remove intraday target error:", err);
       setDayTradeMessage(
         `Unable to remove target: ${
+          err?.message || "Backend request failed."
+        }`
+      );
+    }
+  }
+
+  async function setDayTradePositionStopLoss(position) {
+    const symbol = position?.symbol;
+    const stopLoss = Number(dayTradeStopLossInputs?.[symbol]);
+
+    if (!symbol) return;
+
+    if (!Number.isFinite(stopLoss) || stopLoss <= 0) {
+      setDayTradeMessage(`Enter a valid stop loss for ${symbol}.`);
+      return;
+    }
+
+    try {
+      const data = await fetchJson(
+        `${BACKEND}/api/intraday-paper/stop-loss`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            symbol,
+            stop_loss: stopLoss,
+          }),
+        }
+      );
+
+      setDayTradeMessage(
+        data?.message || `Stop loss updated for ${symbol}.`
+      );
+
+      setDayTradeStopLossInputs((current) => ({
+        ...current,
+        [symbol]: "",
+      }));
+
+      await loadDayTradeData();
+    } catch (err) {
+      console.error("Set intraday stop loss error:", err);
+      setDayTradeMessage(
+        `Unable to update stop loss: ${
+          err?.message || "Backend request failed."
+        }`
+      );
+    }
+  }
+
+  async function removeDayTradePositionStopLoss(position) {
+    const symbol = position?.symbol;
+
+    if (!symbol) return;
+
+    const confirmed = window.confirm(
+      `Remove the automatic stop loss for ${symbol}?`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      const data = await fetchJson(
+        `${BACKEND}/api/intraday-paper/stop-loss/${encodeURIComponent(symbol)}`,
+        { method: "DELETE" }
+      );
+
+      setDayTradeStopLossInputs((current) => ({
+        ...current,
+        [symbol]: "",
+      }));
+
+      setDayTradeMessage(
+        data?.message || `Stop loss removed for ${symbol}.`
+      );
+
+      await loadDayTradeData();
+    } catch (err) {
+      console.error("Remove intraday stop loss error:", err);
+      setDayTradeMessage(
+        `Unable to remove stop loss: ${
           err?.message || "Backend request failed."
         }`
       );
@@ -6121,7 +6202,7 @@ export default function App() {
                 style={{
                   width: "100%",
                   borderCollapse: "collapse",
-                  minWidth: 1340,
+                  minWidth: 1600,
                 }}
               >
                 <thead>
@@ -6134,6 +6215,7 @@ export default function App() {
                     <th style={thStyle}>Margin Used</th>
                     <th style={thStyle}>P&L</th>
                     <th style={thStyle}>Stop Loss</th>
+                    <th style={thStyle}>Edit Stop Loss</th>
                     <th style={thStyle}>Auto Exit</th>
                     <th style={thStyle}>Target Price</th>
                     <th style={thStyle}>Action</th>
@@ -6217,6 +6299,87 @@ export default function App() {
                             Not set
                           </span>
                         )}
+                      </td>
+
+                      <td style={tdStyle}>
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                            minWidth: 255,
+                          }}
+                        >
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.05"
+                            value={
+                              dayTradeStopLossInputs?.[position.symbol] ?? ""
+                            }
+                            onChange={(e) =>
+                              setDayTradeStopLossInputs((current) => ({
+                                ...current,
+                                [position.symbol]: e.target.value,
+                              }))
+                            }
+                            placeholder={
+                              position.stop_loss
+                                ? `Current ${formatMoney(position.stop_loss)}`
+                                : position.direction === "SHORT"
+                                  ? "Stop above LTP ₹"
+                                  : "Stop below LTP ₹"
+                            }
+                            style={{
+                              width: 135,
+                              padding: "7px 8px",
+                              border: "1px solid #cbd5e1",
+                              borderRadius: 7,
+                              background: "#ffffff",
+                              color: "#111827",
+                            }}
+                          />
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setDayTradePositionStopLoss(position)
+                            }
+                            style={{
+                              padding: "7px 9px",
+                              border: "1px solid #dc2626",
+                              borderRadius: 7,
+                              background: "#dc2626",
+                              color: "#ffffff",
+                              fontWeight: 800,
+                              cursor: "pointer",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {position.stop_loss ? "Update SL" : "Set SL"}
+                          </button>
+
+                          {position.stop_loss && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                removeDayTradePositionStopLoss(position)
+                              }
+                              style={{
+                                padding: "7px 9px",
+                                border: "1px solid #dc2626",
+                                borderRadius: 7,
+                                background: "#ffffff",
+                                color: "#dc2626",
+                                fontWeight: 800,
+                                cursor: "pointer",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              Remove
+                            </button>
+                          )}
+                        </div>
                       </td>
 
                       <td style={tdStyle}>

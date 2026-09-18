@@ -382,6 +382,113 @@ def save_all_intraday_trade_history():
         save_intraday_trade(trade)
 
 
+def init_intraday_runtime_state_db():
+    """Create the durable snapshot used to restore active paper-trading state."""
+    init_trade_history_db()
+    with TRADE_HISTORY_WRITE_LOCK:
+        with _trade_history_connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intraday_runtime_state (
+                    state_key TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL,
+                    state_json TEXT NOT NULL
+                )
+                """
+            )
+
+
+def save_intraday_runtime_state():
+    """Persist balance, open positions and pending orders immediately."""
+    init_intraday_runtime_state_db()
+    payload = {
+        "starting_balance": INTRADAY_STARTING_BALANCE,
+        "balance": float(intraday_paper_account.get("balance", INTRADAY_STARTING_BALANCE)),
+        "positions": intraday_paper_positions,
+        "pending_orders": intraday_pending_orders,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, default=str)
+    now = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
+    with TRADE_HISTORY_WRITE_LOCK:
+        with _trade_history_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO intraday_runtime_state (state_key,updated_at,state_json)
+                VALUES ('active',?,?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                    updated_at=excluded.updated_at,
+                    state_json=excluded.state_json
+                """,
+                (now, raw),
+            )
+            connection.execute("COMMIT")
+
+
+def _rebuild_intraday_runtime_from_trade_history():
+    """Best-effort recovery when upgrading from an older database without a state snapshot."""
+    trades = list(reversed(load_intraday_trade_history()))
+    balance = INTRADAY_STARTING_BALANCE
+    positions = {}
+    for trade in trades:
+        symbol = clean_symbol(trade.get("symbol", ""))
+        side = str(trade.get("side", "")).upper()
+        qty = int(trade.get("quantity", 0) or 0)
+        price = safe_float(trade.get("price"))
+        if not symbol or side not in ("BUY", "SELL") or qty <= 0 or price is None:
+            continue
+        balance += safe_float(trade.get("realized_pnl")) or 0.0
+        delta = qty if side == "BUY" else -qty
+        old = positions.get(symbol)
+        old_qty = int(old.get("quantity", 0) or 0) if old else 0
+        old_avg = safe_float(old.get("average_price")) if old else None
+        new_qty = old_qty + delta
+        if old_qty == 0 or (old_qty > 0 and delta > 0) or (old_qty < 0 and delta < 0):
+            old_abs = abs(old_qty)
+            new_abs = old_abs + qty
+            avg = price if old_abs == 0 or old_avg is None else ((old_abs * old_avg) + (qty * price)) / new_abs
+        elif new_qty == 0:
+            positions.pop(symbol, None)
+            continue
+        elif (old_qty > 0 and new_qty > 0) or (old_qty < 0 and new_qty < 0):
+            avg = old_avg if old_avg is not None else price
+        else:
+            avg = price
+        positions[symbol] = {
+            "quantity": new_qty,
+            "average_price": avg,
+            "margin_used": abs(new_qty) * avg * INTRADAY_MARGIN_RATE,
+            "exit_target": None,
+            "stop_loss": safe_float(trade.get("stop_loss")),
+        }
+    return balance, positions
+
+
+def restore_intraday_runtime_state():
+    """Restore active account state after a Render/Uvicorn process restart."""
+    init_intraday_runtime_state_db()
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        row = connection.execute(
+            "SELECT state_json FROM intraday_runtime_state WHERE state_key='active'"
+        ).fetchone()
+    if row:
+        try:
+            payload = json.loads(row[0])
+            intraday_paper_account["balance"] = float(payload.get("balance", INTRADAY_STARTING_BALANCE))
+            intraday_paper_positions.clear()
+            intraday_paper_positions.update(payload.get("positions") or {})
+            intraday_pending_orders.clear()
+            intraday_pending_orders.extend(payload.get("pending_orders") or [])
+            return
+        except Exception:
+            pass
+    balance, positions = _rebuild_intraday_runtime_from_trade_history()
+    intraday_paper_account["balance"] = float(balance)
+    intraday_paper_positions.clear()
+    intraday_paper_positions.update(positions)
+    save_intraday_runtime_state()
+
+
 intraday_paper_trades = load_intraday_trade_history()
 
 
@@ -1010,7 +1117,6 @@ init_scanner_signal_db()
 # the requested BUY / SELL price.
 intraday_pending_orders = []
 
-
 def rebuild_paper_state(trades):
     """Rebuild paper cash and positions from the remaining executed trades.
 
@@ -1098,6 +1204,11 @@ class OrderRequest(BaseModel):
 class IntradayExitTargetRequest(BaseModel):
     symbol: str
     target_price: float
+
+
+class IntradayStopLossRequest(BaseModel):
+    symbol: str
+    stop_loss: float
 
 
 # ============================================================
@@ -1227,6 +1338,11 @@ def safe_float(value):
 
     except Exception:
         return None
+
+
+# All symbol/number helpers and runtime containers now exist, so active
+# paper-trading state can be safely restored from SQLite at startup.
+restore_intraday_runtime_state()
 
 
 def get_ticker(symbol: str):
@@ -4486,6 +4602,7 @@ def place_intraday_paper_order(order: OrderRequest):
             }
 
             intraday_pending_orders.insert(0, pending_order)
+            save_intraday_runtime_state()
 
             return {
                 "status": "waiting",
@@ -4707,6 +4824,7 @@ def place_intraday_paper_order(order: OrderRequest):
         )
 
     intraday_paper_trades.insert(0, trade)
+    save_intraday_runtime_state()
 
     return {
         "status": "success",
@@ -4772,6 +4890,7 @@ def cancel_intraday_pending_order(order_id: str):
         )
 
     removed = intraday_pending_orders.pop(order_index)
+    save_intraday_runtime_state()
 
     return {
         "status": "success",
@@ -4905,6 +5024,7 @@ def check_intraday_pending_orders():
 
     intraday_pending_orders.clear()
     intraday_pending_orders.extend(waiting + not_possible)
+    save_intraday_runtime_state()
 
     return {
         "status": "success",
@@ -4982,6 +5102,7 @@ def set_intraday_exit_target(request: IntradayExitTargetRequest):
         )
 
     position["exit_target"] = target_price
+    save_intraday_runtime_state()
 
     return {
         "status": "success",
@@ -5008,11 +5129,119 @@ def remove_intraday_exit_target(symbol: str):
         )
 
     intraday_paper_positions[clean]["exit_target"] = None
+    save_intraday_runtime_state()
 
     return {
         "status": "success",
         "symbol": clean,
         "message": f"Automatic exit target removed for {clean}.",
+    }
+
+
+# ============================================================
+# SET / EDIT / REMOVE INTRADAY STOP LOSS AFTER EXECUTION
+# ============================================================
+
+@app.post("/api/intraday-paper/stop-loss")
+def set_intraday_stop_loss(request: IntradayStopLossRequest):
+
+    symbol = clean_symbol(request.symbol)
+    stop_loss = safe_float(request.stop_loss)
+
+    if not symbol or symbol not in intraday_paper_positions:
+        raise HTTPException(
+            status_code=404,
+            detail="No open intraday position found for this stock",
+        )
+
+    if stop_loss is None or stop_loss <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid stop-loss price",
+        )
+
+    position = intraday_paper_positions[symbol]
+    qty = int(position.get("quantity", 0) or 0)
+
+    if qty == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No open intraday quantity found",
+        )
+
+    try:
+        current_price = get_latest_equity_price(symbol)
+    except Exception:
+        current_price = safe_float(position.get("average_price"))
+
+    if current_price is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to determine current stock price",
+        )
+
+    # Protective stop-loss validation:
+    # LONG  -> stop loss must remain below current market price.
+    # SHORT -> stop loss must remain above current market price.
+    if qty > 0 and stop_loss >= current_price:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"For a LONG position, stop loss must be below "
+                f"the current price ₹{current_price:,.2f}."
+            ),
+        )
+
+    if qty < 0 and stop_loss <= current_price:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"For a SHORT position, stop loss must be above "
+                f"the current price ₹{current_price:,.2f}."
+            ),
+        )
+
+    previous_stop_loss = safe_float(position.get("stop_loss"))
+    position["stop_loss"] = round(float(stop_loss), 2)
+    save_intraday_runtime_state()
+
+    return {
+        "status": "success",
+        "symbol": symbol,
+        "direction": "LONG" if qty > 0 else "SHORT",
+        "previous_stop_loss": previous_stop_loss,
+        "stop_loss": position["stop_loss"],
+        "current_price": current_price,
+        "message": (
+            f"Stop loss {'updated' if previous_stop_loss is not None else 'set'} "
+            f"for {symbol} at ₹{position['stop_loss']:,.2f}."
+        ),
+    }
+
+
+@app.delete("/api/intraday-paper/stop-loss/{symbol}")
+def remove_intraday_stop_loss(symbol: str):
+
+    clean = clean_symbol(symbol)
+
+    if not clean or clean not in intraday_paper_positions:
+        raise HTTPException(
+            status_code=404,
+            detail="No open intraday position found for this stock",
+        )
+
+    previous_stop_loss = safe_float(
+        intraday_paper_positions[clean].get("stop_loss")
+    )
+    intraday_paper_positions[clean]["stop_loss"] = None
+    save_intraday_runtime_state()
+
+    return {
+        "status": "success",
+        "symbol": clean,
+        "previous_stop_loss": previous_stop_loss,
+        "stop_loss": None,
+        "message": f"Stop loss removed for {clean}.",
     }
 
 
@@ -5117,6 +5346,7 @@ def check_intraday_exit_targets():
             "trade": trade,
         })
 
+    save_intraday_runtime_state()
     return {
         "status": "success",
         "triggered_count": len(triggered),
@@ -5134,6 +5364,7 @@ def reset_intraday_paper_account():
     intraday_paper_account["balance"] = INTRADAY_STARTING_BALANCE
     intraday_paper_positions.clear()
     intraday_pending_orders.clear()
+    save_intraday_runtime_state()
 
     # Do NOT clear intraday_paper_trades here.
     # Executed trades are permanent history and remain in SQLite.

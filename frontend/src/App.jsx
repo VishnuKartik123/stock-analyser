@@ -648,6 +648,7 @@ export default function App() {
     if (!stockSymbol) return;
 
     setAnalysisCategory("INTRADAY");
+    setIntradayChartType("CANDLE");
 
     setSymbol(stockSymbol);
     setSearch("");
@@ -690,6 +691,7 @@ export default function App() {
     loadStock(selectedSymbol);
 
     if (category === "INTRADAY") {
+      setIntradayChartType("CANDLE");
       loadIntraday(selectedSymbol);
     }
 
@@ -701,6 +703,7 @@ export default function App() {
 
     // Refresh the selected stock using the analysis type chosen at the top.
     if (category === "INTRADAY") {
+      setIntradayChartType("CANDLE");
       loadStock(symbol);
       loadIntraday(symbol);
     } else {

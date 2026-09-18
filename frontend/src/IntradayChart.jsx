@@ -84,7 +84,25 @@ export default function IntradayChart({
       .filter((r) => [r.open, r.high, r.low, r.close].every(Number.isFinite))
       .sort((a, b) => a.time - b.time)
       .filter((r, i, a) => i === 0 || r.time !== a[i - 1].time)
-      .slice(-120);
+      .slice(-120)
+      .map((r) => {
+        // Bad provider values such as VWAP=0 can destroy the price scale.
+        // Keep indicators only when they are positive and reasonably close
+        // to the candle itself. OHLC is always left untouched.
+        const mid = (r.high + r.low) / 2;
+        const validIndicator = (value) =>
+          Number.isFinite(value) &&
+          value > 0 &&
+          Number.isFinite(mid) &&
+          Math.abs(value - mid) <= Math.max(mid * 0.15, (r.high - r.low) * 25);
+
+        return {
+          ...r,
+          vwap: validIndicator(r.vwap) ? r.vwap : null,
+          ema9: validIndicator(r.ema9) ? r.ema9 : null,
+          ema20: validIndicator(r.ema20) ? r.ema20 : null,
+        };
+      });
   }, [data]);
 
   const selected = String(symbol || analysis?.symbol || "").toUpperCase();
@@ -111,7 +129,7 @@ export default function IntradayChart({
     const common = {
       layout: { background: { color: "#ffffff" }, textColor: "#667085" },
       grid: { vertLines: { color: "#edf1f5" }, horzLines: { color: "#edf1f5" } },
-      rightPriceScale: { borderColor: "#e5e7eb", scaleMargins: { top: 0.08, bottom: 0.08 } },
+      rightPriceScale: { borderColor: "#e5e7eb", scaleMargins: { top: 0.12, bottom: 0.12 }, autoScale: true },
       timeScale: { borderColor: "#e5e7eb", timeVisible: true, secondsVisible: false },
       localization: { priceFormatter: (price) => `₹${Number(price).toFixed(2)}` },
       crosshair: { vertLine: { color: "#98a2b3", width: 1 }, horzLine: { color: "#98a2b3", width: 1 } },
@@ -141,6 +159,8 @@ export default function IntradayChart({
         wickDownColor: RED,
         priceLineVisible: true,
         lastValueVisible: true,
+        priceLineWidth: 1,
+        priceLineStyle: 2,
       });
       candleSeries.setData(rows.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
     } else {
@@ -151,7 +171,15 @@ export default function IntradayChart({
     const addLine = (key, color, width = 2, style = 0) => {
       const points = rows.filter((r) => Number.isFinite(r[key])).map((r) => ({ time: r.time, value: r[key] }));
       if (!points.length) return;
-      const s = priceChart.addSeries(LineSeries, { color, lineWidth: width, lineStyle: style, priceLineVisible: false, lastValueVisible: true });
+      const s = priceChart.addSeries(LineSeries, {
+        color,
+        lineWidth: width,
+        lineStyle: style,
+        priceLineVisible: false,
+        lastValueVisible: true,
+        // Candles control the visible price range. Indicators are overlays only.
+        autoscaleInfoProvider: () => null,
+      });
       s.setData(points);
     };
 
@@ -191,6 +219,8 @@ export default function IntradayChart({
 
     priceChart.timeScale().fitContent();
     volumeChart.timeScale().fitContent();
+    priceChart.timeScale().applyOptions({ barSpacing: 8, minBarSpacing: 4, rightOffset: 3 });
+    volumeChart.timeScale().applyOptions({ barSpacing: 8, minBarSpacing: 4, rightOffset: 3 });
 
     let syncing = false;
     const syncPrice = (range) => {

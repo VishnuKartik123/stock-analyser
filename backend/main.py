@@ -508,19 +508,27 @@ intraday_paper_trades = load_intraday_trade_history()
 # are used only after a minimum sample exists.
 # ============================================================
 
-MAX_QUALIFIED_SUGGESTIONS_PER_DAY = 3
-QUALIFIED_MIN_SCORE = 7
+# LOSS-REDUCTION MODE
+# The scanner remains active and continues learning from rejected candidates,
+# but live suggestions require materially stronger evidence.
+MAX_QUALIFIED_SUGGESTIONS_PER_DAY = 2
+QUALIFIED_MIN_SCORE = 8
 QUALIFIED_MIN_RISK_REWARD = 1.80
-QUALIFIED_MIN_VOLUME_RATIO = 1.00
+QUALIFIED_MIN_VOLUME_RATIO = 1.20
 
-LATE_SESSION_START_MINUTES = 14 * 60 + 45
-NEW_ENTRY_CUTOFF_MINUTES = 15 * 60 + 15
+# Avoid the opening noise and stop initiating trades earlier in the afternoon.
 MARKET_SETTLED_MINUTES = 9 * 60 + 45
+LATE_SESSION_START_MINUTES = 14 * 60 + 15
+NEW_ENTRY_CUTOFF_MINUTES = 14 * 60 + 45
 
-# Late-session entries must be stronger because less trading time remains.
-LATE_QUALIFIED_MIN_SCORE = 7
-LATE_QUALIFIED_MIN_RISK_REWARD = 1.80
-LATE_QUALIFIED_MIN_VOLUME_RATIO = 1.00
+# Late-session entries must be exceptional.
+LATE_QUALIFIED_MIN_SCORE = 9
+LATE_QUALIFIED_MIN_RISK_REWARD = 2.00
+LATE_QUALIFIED_MIN_VOLUME_RATIO = 1.30
+
+# Portfolio-level defensive limits for the ₹1,00,000 paper account.
+MAX_DAILY_REALIZED_LOSS = 750.0
+MAX_CONSECUTIVE_LOSSES = 2
 
 # Do not use historical performance as a gate until enough resolved examples
 # exist. This avoids overfitting a handful of trades.
@@ -712,6 +720,102 @@ def _historical_setup_stats(side):
     }
 
 
+_MARKET_REGIME_CACHE = {"timestamp": 0.0, "data": None}
+MARKET_REGIME_CACHE_SECONDS = 90
+
+
+def get_intraday_market_regime():
+    """
+    Derive a live market regime from NIFTY rather than hard-coding a news view.
+
+    The daily market brief can tell us when the environment is risky, but the
+    executable gate should react to live price action.  We therefore combine
+    NIFTY 15-minute momentum with its recent daily trend and cache the result
+    so a full scanner pass does not repeatedly download index data.
+    """
+    now_ts = time.time()
+    cached = _MARKET_REGIME_CACHE.get("data")
+    if cached and now_ts - float(_MARKET_REGIME_CACHE.get("timestamp") or 0) < MARKET_REGIME_CACHE_SECONDS:
+        return cached
+
+    result = {
+        "regime": "UNKNOWN",
+        "intraday_direction": "UNKNOWN",
+        "daily_direction": "UNKNOWN",
+        "allow_buy": False,
+        "allow_sell": False,
+        "reason": "NIFTY regime data unavailable",
+    }
+
+    try:
+        intraday = get_history("NIFTY", "5d", "15m")
+        daily = get_history("NIFTY", "1mo", "1d")
+
+        if intraday is not None and len(intraday) >= 20:
+            c = intraday["Close"].astype(float)
+            ema9 = c.ewm(span=9, adjust=False).mean()
+            ema20 = c.ewm(span=20, adjust=False).mean()
+            last = float(c.iloc[-1])
+            i9 = float(ema9.iloc[-1])
+            i20 = float(ema20.iloc[-1])
+            if last > i9 > i20:
+                result["intraday_direction"] = "BULLISH"
+            elif last < i9 < i20:
+                result["intraday_direction"] = "BEARISH"
+            else:
+                result["intraday_direction"] = "MIXED"
+
+        if daily is not None and len(daily) >= 12:
+            c = daily["Close"].astype(float)
+            ema5 = c.ewm(span=5, adjust=False).mean()
+            ema10 = c.ewm(span=10, adjust=False).mean()
+            last = float(c.iloc[-1])
+            d5 = float(ema5.iloc[-1])
+            d10 = float(ema10.iloc[-1])
+            if last > d5 > d10:
+                result["daily_direction"] = "BULLISH"
+            elif last < d5 < d10:
+                result["daily_direction"] = "BEARISH"
+            else:
+                result["daily_direction"] = "MIXED"
+
+        intraday_dir = result["intraday_direction"]
+        daily_dir = result["daily_direction"]
+
+        # Full alignment is preferred.  If the daily trend is mixed, the
+        # intraday trend may still trade, but we never trade against a clearly
+        # opposing daily trend.
+        result["allow_buy"] = (
+            intraday_dir == "BULLISH" and daily_dir != "BEARISH"
+        )
+        result["allow_sell"] = (
+            intraday_dir == "BEARISH" and daily_dir != "BULLISH"
+        )
+
+        if result["allow_buy"] and daily_dir == "BULLISH":
+            result["regime"] = "BULLISH_ALIGNED"
+        elif result["allow_sell"] and daily_dir == "BEARISH":
+            result["regime"] = "BEARISH_ALIGNED"
+        elif result["allow_buy"]:
+            result["regime"] = "BULLISH_INTRADAY"
+        elif result["allow_sell"]:
+            result["regime"] = "BEARISH_INTRADAY"
+        else:
+            result["regime"] = "MIXED_DEFENSIVE"
+
+        result["reason"] = (
+            f"NIFTY intraday={intraday_dir}, daily={daily_dir}; "
+            f"buy={'allowed' if result['allow_buy'] else 'blocked'}, "
+            f"sell={'allowed' if result['allow_sell'] else 'blocked'}"
+        )
+    except Exception as error:
+        result["reason"] = f"NIFTY regime check failed: {error}"
+
+    _MARKET_REGIME_CACHE["timestamp"] = now_ts
+    _MARKET_REGIME_CACHE["data"] = result
+    return result
+
+
 def is_qualified_setup(result):
     """
     Two-level intraday qualification.
@@ -784,6 +888,55 @@ def is_qualified_setup(result):
     trend_15m = str(result.get("trend_15m") or "UNKNOWN").upper()
     chart_ok = (signal == "BUY" and chart_direction == "BULLISH") or (signal == "SELL" and chart_direction == "BEARISH")
     mtf_ok = (signal == "BUY" and trend_15m == "BULLISH") or (signal == "SELL" and trend_15m == "BEARISH")
+
+    price = safe_float(result.get("current_price") or result.get("price"))
+    vwap = safe_float(result.get("vwap"))
+    ema9 = safe_float(result.get("ema9"))
+    ema20 = safe_float(result.get("ema20"))
+    rsi = safe_float(result.get("rsi14") or result.get("rsi"))
+    macd = safe_float(result.get("macd"))
+    macd_signal = safe_float(result.get("macd_signal"))
+    atr = safe_float(result.get("atr14"))
+
+    ema_ok = (
+        (signal == "BUY" and ema9 is not None and ema20 is not None and ema9 > ema20)
+        or (signal == "SELL" and ema9 is not None and ema20 is not None and ema9 < ema20)
+    )
+    vwap_ok = (
+        (signal == "BUY" and price is not None and vwap is not None and price > vwap)
+        or (signal == "SELL" and price is not None and vwap is not None and price < vwap)
+    )
+    rsi_ok = (
+        (signal == "BUY" and rsi is not None and 52 <= rsi <= 68)
+        or (signal == "SELL" and rsi is not None and 32 <= rsi <= 48)
+    )
+    macd_ok = (
+        (signal == "BUY" and macd is not None and macd_signal is not None and macd > macd_signal)
+        or (signal == "SELL" and macd is not None and macd_signal is not None and macd < macd_signal)
+    )
+
+    stop_distance = abs(entry - stop) if entry is not None and stop is not None else None
+    atr_stop_ok = (
+        stop_distance is not None
+        and atr is not None
+        and atr > 0
+        and 0.45 * atr <= stop_distance <= 1.35 * atr
+    )
+
+    support = safe_float(result.get("support"))
+    resistance = safe_float(result.get("resistance"))
+    target_room_ok = True
+    if signal == "BUY" and entry is not None and target1 is not None and resistance is not None and resistance > entry:
+        target_room_ok = resistance >= target1
+    elif signal == "SELL" and entry is not None and target1 is not None and support is not None and support < entry:
+        target_room_ok = support <= target1
+
+    market_regime = get_intraday_market_regime()
+    market_regime_ok = (
+        (signal == "BUY" and market_regime.get("allow_buy") is True)
+        or (signal == "SELL" and market_regime.get("allow_sell") is True)
+    )
+
     loss_controls = today_intraday_loss_controls()
     cooldown_ok = clean_symbol(result.get("symbol", "")) not in loss_controls["losing_symbols"]
 
@@ -800,29 +953,24 @@ def is_qualified_setup(result):
         "historical_filter": historical_ok,
         "chart_confirmation": chart_ok,
         "multi_timeframe_confirmation": mtf_ok,
+        "ema_alignment": ema_ok,
+        "vwap_alignment": vwap_ok,
+        "rsi_momentum_zone": rsi_ok,
+        "macd_confirmation": macd_ok,
+        "atr_stop_quality": atr_stop_ok,
+        "target_room": target_room_ok,
+        "market_regime": market_regime_ok,
         "same_symbol_loss_cooldown": cooldown_ok,
         "daily_loss_circuit_breaker": not loss_controls["circuit_breaker"],
     }
 
-    executable_checks = {
-        "market_settled": checks["market_settled"],
-        "market_open": checks["market_open"],
-        "new_entries_allowed": checks["new_entries_allowed"],
-        "buy_or_sell": checks["buy_or_sell"],
-        "score": score >= executable_min_score,
-        "risk_reward": rr >= executable_min_rr,
-        "volume": volume >= executable_min_volume,
-        "margin": checks["margin"],
-        "valid_trade_levels": valid_levels,
-        "historical_filter": historical_ok,
-        "chart_confirmation": chart_ok,
-        "multi_timeframe_confirmation": mtf_ok,
-        "same_symbol_loss_cooldown": cooldown_ok,
-        "daily_loss_circuit_breaker": not loss_controls["circuit_breaker"],
-    }
+    # Loss-reduction mode: there is no weaker fallback path.
+    # A setup can be executable only when every strict safety/confirmation
+    # check passes.
+    executable_checks = dict(checks)
 
     strict_qualified = all(checks.values())
-    executable = all(executable_checks.values())
+    executable = strict_qualified
 
     quality = round(sum(bool(x) for x in checks.values()) / len(checks) * 10, 1)
 
@@ -836,6 +984,7 @@ def is_qualified_setup(result):
         else "NO_NEW_ENTRIES"
     )
     result["historical_observation"] = historical
+    result["market_regime"] = market_regime
     result["loss_controls"] = loss_controls
     result["defensive_mode"] = bool(loss_controls["circuit_breaker"] or (historical.get("sample_size", 0) >= 10 and (historical.get("success_rate") or 0) < 0.30))
     result["qualification_thresholds"] = {
@@ -2122,20 +2271,62 @@ def scan_historical_candlestick_patterns(df, interval="5m"):
 
 
 def today_intraday_loss_controls():
-    """Return completed-loss count and most recent losing symbols for defensive gating."""
+    """Portfolio-level loss controls used before a new intraday setup is executable."""
     day = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
     trades = load_intraday_trade_history()
-    losses = []
+
+    completed = []
     for t in trades:
         ts = str(t.get("timestamp") or "")
         if not ts.startswith(day):
             continue
-        pnl = safe_float(t.get("realized_pnl"))
+
         action = str(t.get("action") or "").upper()
-        if action.startswith("CLOSE") and pnl is not None and pnl < 0:
-            losses.append((str(t.get("symbol") or "").upper(), ts, pnl))
-    return {"loss_count": len(losses), "circuit_breaker": len(losses) >= 2,
-            "losing_symbols": list(dict.fromkeys(x[0] for x in losses))}
+        pnl = safe_float(t.get("realized_pnl"))
+        if action.startswith("CLOSE") and pnl is not None:
+            completed.append({
+                "symbol": clean_symbol(t.get("symbol", "")),
+                "timestamp": ts,
+                "pnl": float(pnl),
+            })
+
+    completed.sort(key=lambda x: x["timestamp"])
+    losses = [x for x in completed if x["pnl"] < 0]
+    realized_pnl = sum(x["pnl"] for x in completed)
+
+    consecutive_losses = 0
+    for item in reversed(completed):
+        if item["pnl"] < 0:
+            consecutive_losses += 1
+        elif item["pnl"] > 0:
+            break
+
+    circuit_breaker = (
+        consecutive_losses >= MAX_CONSECUTIVE_LOSSES
+        or realized_pnl <= -MAX_DAILY_REALIZED_LOSS
+    )
+
+    reasons = []
+    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+        reasons.append(
+            f"{consecutive_losses} consecutive completed losses reached the daily safety limit"
+        )
+    if realized_pnl <= -MAX_DAILY_REALIZED_LOSS:
+        reasons.append(
+            f"Daily realized P&L ₹{realized_pnl:.2f} crossed the -₹{MAX_DAILY_REALIZED_LOSS:.0f} limit"
+        )
+
+    return {
+        "loss_count": len(losses),
+        "consecutive_losses": consecutive_losses,
+        "realized_pnl": round(realized_pnl, 2),
+        "max_daily_realized_loss": MAX_DAILY_REALIZED_LOSS,
+        "max_consecutive_losses": MAX_CONSECUTIVE_LOSSES,
+        "circuit_breaker": circuit_breaker,
+        "circuit_breaker_reasons": reasons,
+        "losing_symbols": list(dict.fromkeys(x["symbol"] for x in losses if x["symbol"])),
+    }
+
 
 # ============================================================
 # INTRADAY SIGNAL ENGINE
@@ -2144,7 +2335,7 @@ def today_intraday_loss_controls():
 def generate_intraday_signal(
     df,
     symbol="",
-    risk_percent=1.0
+    risk_percent=0.5
 ):
 
     if df is None or df.empty:
@@ -2591,9 +2782,11 @@ def generate_intraday_signal(
     # The simulator uses a 20% intraday margin estimate (= up to 5x
     # exposure). Suggestions are therefore sized so estimated margin
     # targets approximately ₹10,000 per suggested trade whenever the stock price permits.
-    min_estimated_margin = 8000.0
-    max_estimated_margin = 10000.0
-    target_estimated_margin = 9000.0
+    # Defensive sizing while the live strategy is still proving itself.
+    # Smaller exposure reduces rupee loss when a valid-looking setup fails.
+    min_estimated_margin = 4000.0
+    max_estimated_margin = 6000.0
+    target_estimated_margin = 5000.0
 
     quantity = 0
     risk_based_quantity = 0
@@ -3041,7 +3234,7 @@ def intraday_analysis(
     symbol: str = Query(...),
     interval: str = Query("5m"),
     risk_percent: float = Query(
-        1.0,
+        0.5,
         ge=0.1,
         le=5.0
     ),

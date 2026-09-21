@@ -108,6 +108,37 @@ function formatPercent(value) {
   return `${Number(value).toFixed(2)}%`;
 }
 
+// Backend trade timestamps are stored as UTC when no timezone suffix is present.
+// Display trade-history timestamps explicitly in Indian Standard Time (IST).
+function formatTradeTimestampIST(value) {
+  if (value === null || value === undefined || value === "") return "—";
+
+  const raw = String(value).trim();
+  const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  const normalized = hasTimezone ? raw : `${raw}Z`;
+  const date = new Date(normalized);
+
+  if (Number.isNaN(date.getTime())) return raw;
+
+  const parts = new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  }).formatToParts(date);
+
+  const getPart = (type) =>
+    parts.find((part) => part.type === type)?.value || "";
+
+  return `${getPart("day")} ${getPart("month")} ${getPart("year")}, ${getPart(
+    "hour"
+  )}:${getPart("minute")}:${getPart("second")} ${getPart("dayPeriod")} IST`;
+}
+
 function signalColor(signal) {
   if (signal === "BUY") return "#16a34a";
   if (signal === "SELL") return "#dc2626";
@@ -6645,7 +6676,7 @@ export default function App() {
                 <tbody>
                   {dayTradeTrades.map((trade, index) => (
                     <tr key={trade.id || `day-trade-${index}`}>
-                      <td style={tdStyle}>{trade.timestamp || "—"}</td>
+                      <td style={tdStyle}>{formatTradeTimestampIST(trade?.timestamp)}</td>
                       <td style={tdStyle}>{trade.symbol || "—"}</td>
 
                       <td

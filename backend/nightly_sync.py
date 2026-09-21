@@ -377,6 +377,419 @@ def synchronize(export):
         connection.close()
 
 
+
+# ============================================================
+# LOCAL END-OF-DAY LEARNING / TRAINING
+# ============================================================
+# This deliberately uses transparent historical statistics instead of fitting
+# a complex ML model to a small sample.  The profile becomes more influential
+# only after a pattern has enough resolved observations.
+LEARNING_MIN_SAMPLE = max(5, int(os.getenv("LEARNING_MIN_SAMPLE", "20")))
+LEARNING_REPORT_PATH = Path(
+    os.getenv(
+        "LEARNING_REPORT_PATH",
+        str(Path(__file__).resolve().parent / "learning_profile.json"),
+    )
+)
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _number(*values):
+    for value in values:
+        try:
+            if value is None or value == "":
+                continue
+            number = float(value)
+            if number == number and number not in (float("inf"), float("-inf")):
+                return number
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _first(mapping, *keys, default=None):
+    for key in keys:
+        if key in mapping and mapping.get(key) not in (None, ""):
+            return mapping.get(key)
+    return default
+
+
+def _candidate_result(outcome):
+    """Normalize different backend outcome spellings into TARGET/STOP/OTHER."""
+    if not outcome:
+        return "UNRESOLVED"
+
+    raw_values = []
+    for key in (
+        "result", "outcome", "status", "resolution", "first_hit",
+        "hit_first", "exit_reason", "trigger_type", "label",
+    ):
+        value = outcome.get(key)
+        if value is not None:
+            raw_values.append(str(value).upper())
+
+    text = " ".join(raw_values)
+    if any(token in text for token in ("TARGET", "T1", "T2", "TP", "PROFIT", "WIN")):
+        return "TARGET"
+    if any(token in text for token in ("STOP", "SL", "LOSS")):
+        return "STOP"
+    if any(token in text for token in ("AMBIG", "BOTH")):
+        return "AMBIGUOUS"
+    if any(token in text for token in ("NO_LEVEL", "NO HIT", "NONE", "EXPIRED", "TIMEOUT")):
+        return "NO_LEVEL_HIT"
+
+    # Boolean fallbacks used by some review formats.
+    target_hit = any(bool(outcome.get(k)) for k in ("target_hit", "target_1_hit", "t1_hit", "t2_hit"))
+    stop_hit = any(bool(outcome.get(k)) for k in ("stop_hit", "stop_loss_hit", "sl_hit"))
+    if target_hit and not stop_hit:
+        return "TARGET"
+    if stop_hit and not target_hit:
+        return "STOP"
+    if target_hit and stop_hit:
+        return "AMBIGUOUS"
+    return "OTHER"
+
+
+def _time_bucket(timestamp_text):
+    try:
+        dt = datetime.fromisoformat(str(timestamp_text).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(ZoneInfo("Asia/Kolkata"))
+        minutes = dt.hour * 60 + dt.minute
+        if minutes < 9 * 60 + 45:
+            return "BEFORE_09_45"
+        if minutes < 10 * 60 + 30:
+            return "09_45_10_30"
+        if minutes < 12 * 60:
+            return "10_30_12_00"
+        if minutes < 14 * 60 + 45:
+            return "12_00_14_45"
+        return "AFTER_14_45"
+    except Exception:
+        return "UNKNOWN"
+
+
+def _range_bucket(value, cuts, labels):
+    if value is None:
+        return "UNKNOWN"
+    for cut, label in zip(cuts, labels):
+        if value < cut:
+            return label
+    return labels[-1]
+
+
+def _pattern_stats(rows, key_function):
+    groups = {}
+    for row in rows:
+        key = str(key_function(row) or "UNKNOWN")
+        group = groups.setdefault(key, {"samples": 0, "targets": 0, "stops": 0, "other": 0})
+        group["samples"] += 1
+        if row["result"] == "TARGET":
+            group["targets"] += 1
+        elif row["result"] == "STOP":
+            group["stops"] += 1
+        else:
+            group["other"] += 1
+
+    for group in groups.values():
+        decisive = group["targets"] + group["stops"]
+        group["decisive_samples"] = decisive
+        group["success_rate"] = round(group["targets"] / decisive, 4) if decisive else None
+        group["eligible_for_learning"] = decisive >= LEARNING_MIN_SAMPLE
+    return dict(sorted(groups.items(), key=lambda item: (-item[1]["samples"], item[0])))
+
+
+def _build_trade_statistics(connection):
+    trades = []
+    for timestamp, payload in connection.execute(
+        "SELECT timestamp, trade_json FROM intraday_trade_history ORDER BY timestamp"
+    ):
+        trade = _json_object(payload)
+        pnl = _number(trade.get("realized_pnl"), 0.0) or 0.0
+        action = str(trade.get("action") or "").upper()
+        is_close = action.startswith("CLOSE") or abs(pnl) > 1e-12
+        trades.append({
+            "timestamp": timestamp,
+            "symbol": str(trade.get("symbol") or "").upper(),
+            "side": str(trade.get("side") or "").upper(),
+            "action": action,
+            "price": _number(trade.get("price"), trade.get("market_price")),
+            "quantity": _number(trade.get("quantity")),
+            "realized_pnl": pnl,
+            "stop_loss": _number(trade.get("stop_loss")),
+            "exit_reason": str(_first(trade, "exit_reason", "trigger_type", default="") or "").upper(),
+            "is_close": is_close,
+        })
+
+    closes = [trade for trade in trades if trade["is_close"]]
+    wins = [trade for trade in closes if trade["realized_pnl"] > 0]
+    losses = [trade for trade in closes if trade["realized_pnl"] < 0]
+    breakeven = [trade for trade in closes if abs(trade["realized_pnl"]) <= 1e-12]
+    net = sum(trade["realized_pnl"] for trade in closes)
+    gross_profit = sum(trade["realized_pnl"] for trade in wins)
+    gross_loss = abs(sum(trade["realized_pnl"] for trade in losses))
+
+    return {
+        "execution_records": len(trades),
+        "completed_trades": len(closes),
+        "wins": len(wins),
+        "losses": len(losses),
+        "breakeven": len(breakeven),
+        "win_rate": round(len(wins) / len(closes), 4) if closes else None,
+        "net_realized_pnl": round(net, 2),
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else None,
+        "average_win": round(gross_profit / len(wins), 2) if wins else None,
+        "average_loss": round(-gross_loss / len(losses), 2) if losses else None,
+        "by_symbol": _trade_symbol_stats(closes),
+    }
+
+
+def _trade_symbol_stats(closes):
+    result = {}
+    for trade in closes:
+        symbol = trade["symbol"] or "UNKNOWN"
+        row = result.setdefault(symbol, {"completed": 0, "wins": 0, "losses": 0, "net_pnl": 0.0})
+        row["completed"] += 1
+        row["net_pnl"] += trade["realized_pnl"]
+        if trade["realized_pnl"] > 0:
+            row["wins"] += 1
+        elif trade["realized_pnl"] < 0:
+            row["losses"] += 1
+    for row in result.values():
+        row["net_pnl"] = round(row["net_pnl"], 2)
+        row["win_rate"] = round(row["wins"] / row["completed"], 4) if row["completed"] else None
+    return dict(sorted(result.items()))
+
+
+def build_learning_profile(connection):
+    resolved_rows = []
+    total_candidates = 0
+    qualified_candidates = 0
+
+    query = """
+        SELECT trade_date,timestamp,symbol,side,qualified,resolved,candidate_json,outcome_json
+        FROM scanner_candidate_history
+        ORDER BY timestamp
+    """
+    for trade_date, timestamp, symbol, side, qualified, resolved, candidate_json, outcome_json in connection.execute(query):
+        total_candidates += 1
+        qualified_candidates += int(bool(qualified))
+        candidate = _json_object(candidate_json)
+        outcome = _json_object(outcome_json)
+        result = _candidate_result(outcome)
+        if not resolved and result == "UNRESOLVED":
+            continue
+        if result == "UNRESOLVED":
+            result = "OTHER"
+
+        interval = str(_first(candidate, "interval", "timeframe", default="UNKNOWN") or "UNKNOWN")
+        quality = _number(_first(candidate, "setup_quality", "quality", "score"))
+        rr = _number(_first(candidate, "risk_reward", "rr", "risk_reward_ratio"))
+        volume_ratio = _number(_first(candidate, "volume_ratio", "relative_volume", "rvol"))
+        rsi = _number(_first(candidate, "rsi", "rsi_14"))
+        price = _number(_first(candidate, "entry_price", "entry", "current_price", "price"))
+        vwap = _number(_first(candidate, "vwap", "VWAP"))
+        ema9 = _number(_first(candidate, "ema9", "ema_9", "EMA9"))
+        ema20 = _number(_first(candidate, "ema20", "ema_20", "EMA20"))
+
+        if ema9 is not None and ema20 is not None:
+            ema_alignment = "BULLISH" if ema9 > ema20 else "BEARISH" if ema9 < ema20 else "FLAT"
+        else:
+            ema_alignment = "UNKNOWN"
+        if price is not None and vwap is not None:
+            vwap_position = "ABOVE" if price > vwap else "BELOW" if price < vwap else "AT"
+        else:
+            vwap_position = "UNKNOWN"
+
+        resolved_rows.append({
+            "trade_date": trade_date,
+            "timestamp": timestamp,
+            "symbol": str(symbol or "").upper(),
+            "side": str(side or "").upper(),
+            "qualified": bool(qualified),
+            "result": result,
+            "interval": interval,
+            "time_bucket": _time_bucket(timestamp),
+            "quality": quality,
+            "rr": rr,
+            "volume_ratio": volume_ratio,
+            "rsi": rsi,
+            "ema_alignment": ema_alignment,
+            "vwap_position": vwap_position,
+        })
+
+    decisive = [row for row in resolved_rows if row["result"] in ("TARGET", "STOP")]
+    target_count = sum(row["result"] == "TARGET" for row in decisive)
+    stop_count = sum(row["result"] == "STOP" for row in decisive)
+
+    dimensions = {
+        "side": _pattern_stats(decisive, lambda r: r["side"]),
+        "interval": _pattern_stats(decisive, lambda r: r["interval"]),
+        "time_bucket": _pattern_stats(decisive, lambda r: r["time_bucket"]),
+        "qualified": _pattern_stats(decisive, lambda r: "QUALIFIED" if r["qualified"] else "REJECTED"),
+        "setup_quality": _pattern_stats(
+            decisive,
+            lambda r: _range_bucket(r["quality"], [6, 7, 8, 9], ["<6", "6-6.99", "7-7.99", "8+"])
+        ),
+        "risk_reward": _pattern_stats(
+            decisive,
+            lambda r: _range_bucket(r["rr"], [1.2, 1.5, 1.8, 2.0], ["<1.2", "1.2-1.49", "1.5-1.79", "1.8+"])
+        ),
+        "volume_ratio": _pattern_stats(
+            decisive,
+            lambda r: _range_bucket(r["volume_ratio"], [0.8, 1.0, 1.2, 1.5], ["<0.8", "0.8-0.99", "1.0-1.19", "1.2+"])
+        ),
+        "rsi": _pattern_stats(
+            decisive,
+            lambda r: _range_bucket(r["rsi"], [40, 50, 60, 70], ["<40", "40-49.9", "50-59.9", "60+"])
+        ),
+        "ema_alignment": _pattern_stats(decisive, lambda r: r["ema_alignment"]),
+        "vwap_position": _pattern_stats(decisive, lambda r: r["vwap_position"]),
+    }
+
+    eligible_patterns = []
+    for dimension, groups in dimensions.items():
+        for name, stats in groups.items():
+            if not stats["eligible_for_learning"] or stats["success_rate"] is None:
+                continue
+            eligible_patterns.append({
+                "dimension": dimension,
+                "value": name,
+                "decisive_samples": stats["decisive_samples"],
+                "success_rate": stats["success_rate"],
+            })
+    eligible_patterns.sort(key=lambda item: (-item["decisive_samples"], -item["success_rate"]))
+
+    return {
+        "generated_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+        "minimum_pattern_sample": LEARNING_MIN_SAMPLE,
+        "candidate_summary": {
+            "total": total_candidates,
+            "qualified": qualified_candidates,
+            "resolved": len(resolved_rows),
+            "decisive": len(decisive),
+            "target_first": target_count,
+            "stop_first": stop_count,
+            "historical_success_rate": round(target_count / len(decisive), 4) if decisive else None,
+        },
+        "trade_summary": _build_trade_statistics(connection),
+        "dimensions": dimensions,
+        "eligible_patterns": eligible_patterns,
+        "policy": {
+            "mode": "STATISTICAL_OBSERVATION",
+            "auto_change_live_thresholds": False,
+            "reason": (
+                "Learning profile records evidence but does not automatically rewrite trading thresholds. "
+                "Only patterns meeting the minimum sample are marked eligible, and changes should be "
+                "validated on later out-of-sample sessions."
+            ),
+        },
+    }
+
+
+def save_learning_profile(profile):
+    LEARNING_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = LEARNING_REPORT_PATH.with_suffix(LEARNING_REPORT_PATH.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(profile, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    temp_path.replace(LEARNING_REPORT_PATH)
+
+    connection = sqlite3.connect(LOCAL_DB, timeout=30)
+    try:
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS learning_profile_history (
+                generated_at TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL
+            )
+        """)
+        connection.execute("""
+            INSERT OR REPLACE INTO learning_profile_history(generated_at, profile_json)
+            VALUES(?, ?)
+        """, (
+            profile["generated_at"],
+            json.dumps(profile, ensure_ascii=False, default=str),
+        ))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def train_local_archive():
+    connection = sqlite3.connect(LOCAL_DB, timeout=30)
+    try:
+        connection.execute("PRAGMA busy_timeout=30000")
+        init_local_db(connection)
+        profile = build_learning_profile(connection)
+    finally:
+        connection.close()
+
+    save_learning_profile(profile)
+    return profile
+
+
+def print_learning_summary(profile):
+    candidates = profile["candidate_summary"]
+    trades = profile["trade_summary"]
+
+    print()
+    print("LOCAL LEARNING / TRAINING COMPLETE")
+    print("-" * 64)
+    print(f"Candidates total    : {candidates['total']}")
+    print(f"Candidates resolved : {candidates['resolved']}")
+    print(f"Decisive outcomes   : {candidates['decisive']}")
+    print(f"Target first        : {candidates['target_first']}")
+    print(f"Stop first          : {candidates['stop_first']}")
+    if candidates["historical_success_rate"] is not None:
+        print(f"Candidate success   : {candidates['historical_success_rate'] * 100:.2f}%")
+    else:
+        print("Candidate success   : Not enough resolved target/stop outcomes")
+
+    print("-" * 64)
+    print(f"Execution records   : {trades['execution_records']}")
+    print(f"Completed trades    : {trades['completed_trades']}")
+    print(f"Wins / Losses       : {trades['wins']} / {trades['losses']}")
+    if trades["win_rate"] is not None:
+        print(f"Executed win rate   : {trades['win_rate'] * 100:.2f}%")
+    else:
+        print("Executed win rate   : No completed trades")
+    print(f"Net realized P&L    : INR {trades['net_realized_pnl']:.2f}")
+    print("-" * 64)
+
+    eligible = profile.get("eligible_patterns") or []
+    if eligible:
+        print("Patterns with enough decisive samples:")
+        for item in eligible[:10]:
+            print(
+                f"  {item['dimension']}={item['value']} | "
+                f"n={item['decisive_samples']} | "
+                f"success={item['success_rate'] * 100:.2f}%"
+            )
+    else:
+        print(
+            f"No individual pattern has {LEARNING_MIN_SAMPLE} decisive samples yet. "
+            "Data was learned and retained, but thresholds were not auto-changed."
+        )
+
+    print(f"Learning profile    : {LEARNING_REPORT_PATH}")
+    print("Mode                : observation + evidence collection")
+    print("Live thresholds     : unchanged automatically")
+
 def main():
     print("=" * 64)
     print("STOCK ANALYSER - NIGHTLY RENDER -> LOCAL SYNC")
@@ -435,6 +848,10 @@ def main():
     print("Database verification: PASSED")
     print()
     print("The local SQLite database is now the permanent learning archive.")
+
+    # Train immediately after every successful nightly synchronization.
+    profile = train_local_archive()
+    print_learning_summary(profile)
 
 
 if __name__ == "__main__":

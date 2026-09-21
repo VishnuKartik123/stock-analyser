@@ -574,6 +574,18 @@ def _trade_symbol_stats(closes):
     return dict(sorted(result.items()))
 
 
+def _candidate_cohort(candidate, qualified):
+    strict = bool(_first(candidate, "strict_qualified", "strictQualified", default=False))
+    executable = bool(_first(candidate, "executable", "is_executable", "trade_executable", default=False))
+    if executable:
+        return "EXECUTABLE"
+    if strict:
+        return "STRICT_QUALIFIED"
+    if bool(qualified):
+        return "QUALIFIED_LEGACY"
+    return "REJECTED"
+
+
 def build_learning_profile(connection):
     resolved_rows = []
     total_candidates = 0
@@ -595,11 +607,11 @@ def build_learning_profile(connection):
         if result == "UNRESOLVED":
             result = "OTHER"
 
-        interval = str(_first(candidate, "interval", "timeframe", default="UNKNOWN") or "UNKNOWN")
+        interval = str(_first(candidate, "interval", "timeframe", "scanner_interval", "chart_interval", "intraday_interval", default="UNKNOWN") or "UNKNOWN")
         quality = _number(_first(candidate, "setup_quality", "quality", "score"))
         rr = _number(_first(candidate, "risk_reward", "rr", "risk_reward_ratio"))
         volume_ratio = _number(_first(candidate, "volume_ratio", "relative_volume", "rvol"))
-        rsi = _number(_first(candidate, "rsi", "rsi_14"))
+        rsi = _number(_first(candidate, "rsi", "rsi14", "rsi_14", "RSI", "RSI14"))
         price = _number(_first(candidate, "entry_price", "entry", "current_price", "price"))
         vwap = _number(_first(candidate, "vwap", "VWAP"))
         ema9 = _number(_first(candidate, "ema9", "ema_9", "EMA9"))
@@ -620,6 +632,7 @@ def build_learning_profile(connection):
             "symbol": str(symbol or "").upper(),
             "side": str(side or "").upper(),
             "qualified": bool(qualified),
+            "cohort": _candidate_cohort(candidate, qualified),
             "result": result,
             "interval": interval,
             "time_bucket": _time_bucket(timestamp),
@@ -635,11 +648,28 @@ def build_learning_profile(connection):
     target_count = sum(row["result"] == "TARGET" for row in decisive)
     stop_count = sum(row["result"] == "STOP" for row in decisive)
 
+    def cohort_summary(name):
+        rows = [row for row in resolved_rows if row["cohort"] == name]
+        drows = [row for row in rows if row["result"] in ("TARGET", "STOP")]
+        targets = sum(row["result"] == "TARGET" for row in drows)
+        stops = sum(row["result"] == "STOP" for row in drows)
+        return {
+            "resolved": len(rows), "decisive": len(drows),
+            "target_first": targets, "stop_first": stops,
+            "success_rate": round(targets / len(drows), 4) if drows else None,
+        }
+
+    cohort_summaries = {
+        name: cohort_summary(name)
+        for name in ("REJECTED", "QUALIFIED_LEGACY", "STRICT_QUALIFIED", "EXECUTABLE")
+    }
+
     dimensions = {
         "side": _pattern_stats(decisive, lambda r: r["side"]),
         "interval": _pattern_stats(decisive, lambda r: r["interval"]),
         "time_bucket": _pattern_stats(decisive, lambda r: r["time_bucket"]),
         "qualified": _pattern_stats(decisive, lambda r: "QUALIFIED" if r["qualified"] else "REJECTED"),
+        "cohort": _pattern_stats(decisive, lambda r: r["cohort"]),
         "setup_quality": _pattern_stats(
             decisive,
             lambda r: _range_bucket(r["quality"], [6, 7, 8, 9], ["<6", "6-6.99", "7-7.99", "8+"])
@@ -686,6 +716,11 @@ def build_learning_profile(connection):
             "historical_success_rate": round(target_count / len(decisive), 4) if decisive else None,
         },
         "trade_summary": _build_trade_statistics(connection),
+        "cohort_summaries": cohort_summaries,
+        "data_quality": {
+            "unknown_interval": sum(row["interval"] == "UNKNOWN" for row in resolved_rows),
+            "unknown_rsi": sum(row["rsi"] is None for row in resolved_rows),
+        },
         "dimensions": dimensions,
         "eligible_patterns": eligible_patterns,
         "policy": {
@@ -769,6 +804,18 @@ def print_learning_summary(profile):
     else:
         print("Executed win rate   : No completed trades")
     print(f"Net realized P&L    : INR {trades['net_realized_pnl']:.2f}")
+    print("-" * 64)
+    print("CANDIDATE COHORTS")
+    for name in ("EXECUTABLE", "STRICT_QUALIFIED", "QUALIFIED_LEGACY", "REJECTED"):
+        stats = (profile.get("cohort_summaries") or {}).get(name, {})
+        rate = stats.get("success_rate")
+        rate_text = f"{rate * 100:.2f}%" if rate is not None else "N/A"
+        print(f"  {name:<18} | resolved={stats.get('resolved',0):>3} | decisive={stats.get('decisive',0):>3} | target={stats.get('target_first',0):>3} | stop={stats.get('stop_first',0):>3} | success={rate_text}")
+    quality = profile.get("data_quality") or {}
+    print("-" * 64)
+    print("DATA QUALITY")
+    print(f"  Unknown interval  : {quality.get('unknown_interval', 0)}")
+    print(f"  Unknown RSI       : {quality.get('unknown_rsi', 0)}")
     print("-" * 64)
 
     eligible = profile.get("eligible_patterns") or []

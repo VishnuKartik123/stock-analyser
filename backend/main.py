@@ -535,6 +535,9 @@ MAX_CONSECUTIVE_LOSSES = 2
 HISTORICAL_MIN_SAMPLE = 20
 HISTORICAL_MIN_SUCCESS_RATE = 0.45
 
+# Version tag stored with every new scanner observation.
+SCANNER_STRATEGY_VERSION = "strict_v2"
+
 
 def init_scanner_signal_db():
     with sqlite3.connect(TRADE_HISTORY_DB) as connection:
@@ -635,6 +638,24 @@ def store_scanner_candidate(result):
     snapshot = dict(result)
     snapshot["candidate_id"] = candidate_id
     snapshot["captured_at"] = now.isoformat()
+    snapshot["strategy_version"] = str(
+        result.get("strategy_version") or SCANNER_STRATEGY_VERSION
+    )
+    snapshot["interval"] = str(
+        result.get("interval") or result.get("timeframe") or "UNKNOWN"
+    )
+    snapshot["timeframe"] = snapshot["interval"]
+    snapshot["strict_qualified"] = bool(result.get("strict_qualified"))
+    snapshot["executable"] = bool(result.get("executable"))
+    snapshot["rsi14"] = safe_float(
+        result.get("rsi14")
+        if result.get("rsi14") is not None
+        else (result.get("indicators") or {}).get("rsi14")
+    )
+    regime = result.get("market_regime")
+    snapshot["market_regime"] = regime if isinstance(regime, dict) else {
+        "regime": str(regime or "UNKNOWN")
+    }
 
     with sqlite3.connect(TRADE_HISTORY_DB) as connection:
         existing = connection.execute(
@@ -676,47 +697,69 @@ def store_scanner_candidate(result):
 
 
 def _historical_setup_stats(side):
-    """Return resolved historical performance for a BUY or SELL setup."""
+    """
+    Historical performance used by the live gate.
+
+    IMPORTANT: rejected scanner observations are retained for research but do
+    not control live qualification. Only candidates that were executable,
+    strict-qualified, or legacy-qualified are included.
+    """
     init_scanner_signal_db()
     side = str(side or "").upper()
 
     with sqlite3.connect(TRADE_HISTORY_DB) as connection:
         rows = connection.execute(
             """
-            SELECT outcome_json
+            SELECT qualified, candidate_json, outcome_json
             FROM scanner_candidate_history
             WHERE side=? AND resolved=1 AND outcome_json IS NOT NULL
             ORDER BY trade_date DESC
-            LIMIT 250
+            LIMIT 500
             """,
             (side,),
         ).fetchall()
 
     outcomes = []
-    for (raw,) in rows:
+    for qualified, candidate_raw, outcome_raw in rows:
         try:
-            item = json.loads(raw)
-            if isinstance(item, dict):
-                outcomes.append(item)
+            candidate = json.loads(candidate_raw or "{}")
+            outcome = json.loads(outcome_raw or "{}")
         except Exception:
             continue
 
-    sample = len(outcomes)
+        if not isinstance(candidate, dict) or not isinstance(outcome, dict):
+            continue
+
+        eligible_cohort = (
+            candidate.get("executable") is True
+            or candidate.get("strict_qualified") is True
+            or bool(qualified)
+        )
+        if not eligible_cohort:
+            continue
+
+        outcomes.append(outcome)
+
+    decisive = [
+        x for x in outcomes
+        if x.get("result") in ("T1_FIRST", "T2_FIRST", "SL_FIRST")
+    ]
     successes = sum(
-        1 for x in outcomes
+        1 for x in decisive
         if x.get("result") in ("T1_FIRST", "T2_FIRST")
     )
-    failures = sum(1 for x in outcomes if x.get("result") == "SL_FIRST")
-    unresolved = max(0, sample - successes - failures)
+    failures = sum(1 for x in decisive if x.get("result") == "SL_FIRST")
+    sample = len(decisive)
     success_rate = (successes / sample) if sample else None
 
     return {
         "sample_size": sample,
         "successes": successes,
         "failures": failures,
-        "other": unresolved,
+        "other": max(0, len(outcomes) - sample),
         "success_rate": round(success_rate, 4) if success_rate is not None else None,
         "sufficient_sample": sample >= HISTORICAL_MIN_SAMPLE,
+        "cohort": "EXECUTABLE_OR_QUALIFIED_ONLY",
     }
 
 
@@ -1160,7 +1203,12 @@ def run_end_of_day_review(trade_date=None, force=False):
 
         df = None
         try:
-            df = get_history(symbol, "5d", "5m")
+            candidate_interval = str(
+                candidate.get("interval") or candidate.get("timeframe") or "5m"
+            )
+            if candidate_interval not in ("5m", "15m", "30m"):
+                candidate_interval = "5m"
+            df = get_history(symbol, "5d", candidate_interval)
             outcome = _candidate_outcome_from_intraday_data(candidate, df)
         except Exception as error:
             outcome = {
@@ -2335,7 +2383,8 @@ def today_intraday_loss_controls():
 def generate_intraday_signal(
     df,
     symbol="",
-    risk_percent=0.5
+    risk_percent=0.5,
+    interval="5m",
 ):
 
     if df is None or df.empty:
@@ -2399,7 +2448,7 @@ def generate_intraday_signal(
         get_support_resistance(df)
     )
 
-    chart_analysis = build_chart_analysis(df, "5m")
+    chart_analysis = build_chart_analysis(df, interval)
     df15 = resample_to_15m(df)
     chart_analysis_15m = build_chart_analysis(df15, "15m") if df15 is not None and len(df15) >= 12 else {"interval": "15m", "direction": "UNKNOWN", "candlestick_patterns": [], "trend": "UNKNOWN", "structure": "INSUFFICIENT_DATA", "breakout": "NONE"}
 
@@ -2965,6 +3014,9 @@ def generate_intraday_signal(
     return {
 
         "symbol": clean_symbol(symbol),
+        "interval": str(interval),
+        "timeframe": str(interval),
+        "strategy_version": SCANNER_STRATEGY_VERSION,
 
         "signal": signal,
 
@@ -3266,7 +3318,8 @@ def intraday_analysis(
         result = generate_intraday_signal(
             df,
             clean,
-            risk_percent
+            risk_percent,
+            interval
         )
 
         # Evaluate whether the LIVE setup is actually executable using the
@@ -3437,7 +3490,9 @@ def intraday_scanner(
             df = calculate_intraday_indicators(df)
             result = generate_intraday_signal(
                 df,
-                stock_symbol
+                stock_symbol,
+                0.5,
+                interval
             )
             result["name"] = stock_name
             result["error"] = None

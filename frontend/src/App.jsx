@@ -443,6 +443,11 @@ export default function App() {
   const [dayTradeTargetInputs, setDayTradeTargetInputs] = useState({});
   const [dayTradeStopLossInputs, setDayTradeStopLossInputs] = useState({});
 
+  // Local nightly learning profile
+  const [learningProfile, setLearningProfile] = useState(null);
+  const [learningProfileLoading, setLearningProfileLoading] = useState(false);
+  const [learningProfileError, setLearningProfileError] = useState("");
+
   const [orderMessage, setOrderMessage] = useState("");
 
   // ==========================================================
@@ -764,6 +769,27 @@ export default function App() {
     } catch (err) {
       console.error("Search error:", err);
       setSearchResults([]);
+    }
+  }
+
+  // ==========================================================
+  // LOCAL NIGHTLY LEARNING PROFILE
+  // ==========================================================
+
+  async function loadLearningProfile() {
+    setLearningProfileLoading(true);
+
+    try {
+      const data = await fetchJson(`${BACKEND}/api/learning/profile`);
+      setLearningProfile(data);
+      setLearningProfileError("");
+    } catch (err) {
+      console.error("Learning profile error:", err);
+      setLearningProfileError(
+        err?.message || "Unable to load the local learning profile."
+      );
+    } finally {
+      setLearningProfileLoading(false);
     }
   }
 
@@ -1661,6 +1687,7 @@ export default function App() {
     loadStock("NIFTY 50");
     loadPaperData();
     loadDayTradeData();
+    loadLearningProfile();
     loadIntraday("NIFTY 50");
   }, [isAuthenticated]);
 
@@ -1728,6 +1755,22 @@ export default function App() {
 
     return () => clearInterval(scannerTimer);
   }, [intradayInterval]);
+
+  // ==========================================================
+  // REFRESH LOCAL LEARNING PROFILE
+  // ==========================================================
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    const learningTimer = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        loadLearningProfile();
+      }
+    }, 60000);
+
+    return () => clearInterval(learningTimer);
+  }, [isAuthenticated]);
 
   // ==========================================================
   // LOAD PRICE WHEN PAPER-TRADING STOCK CHANGES
@@ -5417,6 +5460,232 @@ export default function App() {
               The simulator uses an estimated 20% margin requirement
               (maximum 5x leverage).
             </span>
+          </div>
+
+          {/* Local nightly learning summary */}
+
+          <div
+            style={{
+              background: "#ffffff",
+              border: "1px solid #cbd5e1",
+              borderRadius: 12,
+              padding: 16,
+              marginBottom: 16,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+                marginBottom: 12,
+              }}
+            >
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 900, color: "#0f172a" }}>
+                  Local Learning / Training
+                </div>
+                <div style={{ fontSize: 12, color: "#64748b", marginTop: 3 }}>
+                  Latest nightly Render → local learning profile
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={loadLearningProfile}
+                disabled={learningProfileLoading}
+                style={{
+                  border: "1px solid #cbd5e1",
+                  background: "#f8fafc",
+                  color: "#0f172a",
+                  borderRadius: 8,
+                  padding: "8px 12px",
+                  fontWeight: 800,
+                  cursor: learningProfileLoading ? "default" : "pointer",
+                }}
+              >
+                {learningProfileLoading ? "Refreshing..." : "Refresh Learning"}
+              </button>
+            </div>
+
+            {learningProfileError ? (
+              <div
+                style={{
+                  padding: 10,
+                  borderRadius: 8,
+                  background: "#fee2e2",
+                  color: "#991b1b",
+                  fontWeight: 700,
+                }}
+              >
+                {learningProfileError}
+              </div>
+            ) : learningProfile?.available === false ? (
+              <div style={{ color: "#64748b" }}>
+                {learningProfile?.message || "No learning profile available yet."}
+              </div>
+            ) : learningProfile ? (
+              <>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(135px, 1fr))",
+                    gap: 9,
+                  }}
+                >
+                  {[
+                    ["Candidates", learningProfile?.candidate_summary?.total ?? 0],
+                    ["Resolved", learningProfile?.candidate_summary?.resolved ?? 0],
+                    ["Decisive", learningProfile?.candidate_summary?.decisive ?? 0],
+                    ["Completed Trades", learningProfile?.trade_summary?.completed_trades ?? 0],
+                    [
+                      "Wins / Losses",
+                      `${learningProfile?.trade_summary?.wins ?? 0} / ${
+                        learningProfile?.trade_summary?.losses ?? 0
+                      }`,
+                    ],
+                    [
+                      "Executed Win Rate",
+                      learningProfile?.trade_summary?.win_rate == null
+                        ? "—"
+                        : `${(
+                            Number(learningProfile.trade_summary.win_rate) * 100
+                          ).toFixed(2)}%`,
+                    ],
+                    [
+                      "Net Realized P&L",
+                      formatMoney(
+                        learningProfile?.trade_summary?.net_realized_pnl ?? 0
+                      ),
+                    ],
+                    [
+                      "Unknown Interval",
+                      learningProfile?.data_quality?.unknown_interval ?? 0,
+                    ],
+                    ["Unknown RSI", learningProfile?.data_quality?.unknown_rsi ?? 0],
+                  ].map(([label, value]) => (
+                    <div
+                      key={label}
+                      style={{
+                        padding: 10,
+                        border: "1px solid #e2e8f0",
+                        borderRadius: 8,
+                        background: "#f8fafc",
+                      }}
+                    >
+                      <div style={{ fontSize: 11, color: "#64748b" }}>{label}</div>
+                      <div
+                        style={{
+                          marginTop: 4,
+                          fontSize: 16,
+                          fontWeight: 900,
+                          color:
+                            label === "Net Realized P&L" &&
+                            Number(learningProfile?.trade_summary?.net_realized_pnl) < 0
+                              ? "#dc2626"
+                              : "#0f172a",
+                        }}
+                      >
+                        {value}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
+                    gap: 9,
+                    marginTop: 10,
+                  }}
+                >
+                  {["EXECUTABLE", "STRICT_QUALIFIED", "QUALIFIED_LEGACY", "REJECTED"].map(
+                    (name) => {
+                      const stats = learningProfile?.cohort_summaries?.[name] || {};
+                      const success =
+                        stats?.success_rate == null
+                          ? "N/A"
+                          : `${(Number(stats.success_rate) * 100).toFixed(2)}%`;
+
+                      return (
+                        <div
+                          key={name}
+                          style={{
+                            border: "1px solid #e2e8f0",
+                            borderRadius: 8,
+                            padding: 10,
+                            background: "#ffffff",
+                          }}
+                        >
+                          <div
+                            style={{
+                              fontSize: 12,
+                              fontWeight: 900,
+                              color: "#334155",
+                              marginBottom: 5,
+                            }}
+                          >
+                            {name.replaceAll("_", " ")}
+                          </div>
+                          <div style={{ fontSize: 12, color: "#475569", lineHeight: 1.6 }}>
+                            Resolved: <strong>{stats?.resolved ?? 0}</strong>
+                            {" • "}Decisive: <strong>{stats?.decisive ?? 0}</strong>
+                            <br />
+                            Target / Stop:{" "}
+                            <strong>
+                              {stats?.target_first ?? 0} / {stats?.stop_first ?? 0}
+                            </strong>
+                            {" • "}Success: <strong>{success}</strong>
+                          </div>
+                        </div>
+                      );
+                    }
+                  )}
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 10,
+                    paddingTop: 10,
+                    borderTop: "1px solid #e2e8f0",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: 10,
+                    flexWrap: "wrap",
+                    fontSize: 12,
+                    color: "#64748b",
+                  }}
+                >
+                  <span>
+                    Last learning update:{" "}
+                    <strong style={{ color: "#334155" }}>
+                      {learningProfile?.generated_at
+                        ? formatTradeTimestampIST(learningProfile.generated_at)
+                        : "—"}
+                    </strong>
+                  </span>
+                  <span>
+                    Mode:{" "}
+                    <strong style={{ color: "#334155" }}>
+                      {learningProfile?.policy?.mode || "—"}
+                    </strong>
+                    {" • "}Live thresholds:{" "}
+                    <strong style={{ color: "#334155" }}>
+                      {learningProfile?.policy?.auto_change_live_thresholds
+                        ? "AUTO"
+                        : "UNCHANGED"}
+                    </strong>
+                  </span>
+                </div>
+              </>
+            ) : (
+              <div style={{ color: "#64748b" }}>
+                Loading local learning profile...
+              </div>
+            )}
           </div>
 
           {/* Account summary */}

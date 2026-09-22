@@ -426,6 +426,18 @@ export default function App() {
   const [multiTimeframeError, setMultiTimeframeError] = useState("");
   const [multiTimeframeUpdatedAt, setMultiTimeframeUpdatedAt] = useState("");
   const [multiTimeframeMeta, setMultiTimeframeMeta] = useState(null);
+  // Only show stocks where 5m and 15m agree on the same BUY/SELL direction.
+  const alignedMultiTimeframeData = multiTimeframeData.filter((row) => {
+    const signal5m = String(row?.signal_5m || "").toUpperCase();
+    const signal15m = String(row?.signal_15m || "").toUpperCase();
+    const alignment = String(row?.alignment || "").toUpperCase();
+
+    return (
+      alignment === "ALIGNED" &&
+      (signal5m === "BUY" || signal5m === "SELL") &&
+      signal5m === signal15m
+    );
+  });
   const [strategyMode, setStrategyMode] = useState("INVERSE");
   const [strategyModeLoading, setStrategyModeLoading] = useState(false);
 
@@ -764,12 +776,23 @@ export default function App() {
         { method: "POST" }
       );
 
-      setStrategyMode(String(data?.mode || nextMode).toUpperCase());
+      const appliedMode = String(data?.mode || nextMode).toUpperCase();
+      setStrategyMode(appliedMode);
 
-      // Immediately rebuild both scanner views under the newly selected mode.
+      // Never leave NORMAL levels in the order form after switching to INVERSE
+      // (or vice versa). Fresh levels are loaded from the new-mode analysis.
+      setDayTradeStopLoss("");
+      setDayTradeTarget1("");
+      setDayTradeOrderPrice("");
+      setPaperStopLoss("");
+      setPaperOrderPrice("");
+
+      // Immediately rebuild both scanner views and the selected stock under
+      // the newly selected strategy mode.
       await Promise.allSettled([
         loadScanner(true),
         loadMultiTimeframeScanner(true),
+        loadIntraday(symbol, intradayChartPeriod, intradayInterval),
       ]);
     } catch (err) {
       console.error("Strategy mode switch error:", err);
@@ -792,7 +815,9 @@ export default function App() {
     setSearchResults([]);
 
     loadStock(stockSymbol);
-    loadIntraday(stockSymbol);
+    // The backend applies the currently active NORMAL/INVERSE strategy mode,
+    // so the detailed Intraday Analyzer always matches the suggestion mode.
+    loadIntraday(stockSymbol, intradayChartPeriod, intradayInterval);
 
     // Go directly to the Full Intraday Analysis section,
     // not to the top of the page.
@@ -1150,6 +1175,11 @@ export default function App() {
       signalTarget1 !== ""
         ? String(signalTarget1)
         : ""
+    );
+
+    setDayTradeMessage(
+      `${strategyMode} ${signalSide} setup loaded for ${symbol}. ` +
+      `Entry, stop-loss and target levels are synchronized with the active strategy mode.`
     );
 
     // Use MARKET by default so pressing BUY/SELL executes at the latest
@@ -3711,12 +3741,15 @@ export default function App() {
                 onClick={() => loadMultiTimeframeScanner(true)}
                 disabled={multiTimeframeLoading}
                 style={{
-                  border: "1px solid #cbd5e1",
-                  background: "#f8fafc",
+                  border: "1px solid #2563eb",
+                  background: multiTimeframeLoading ? "#94a3b8" : "#2563eb",
+                  color: "#ffffff",
                   borderRadius: 8,
-                  padding: "8px 12px",
-                  fontWeight: 800,
-                  cursor: multiTimeframeLoading ? "default" : "pointer",
+                  padding: "9px 14px",
+                  fontWeight: 900,
+                  cursor: multiTimeframeLoading ? "not-allowed" : "pointer",
+                  boxShadow: "0 1px 3px rgba(0, 0, 0, 0.15)",
+                  opacity: 1,
                 }}
               >
                 {multiTimeframeLoading ? "Scanning..." : "Refresh 5m + 15m"}
@@ -3776,7 +3809,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {multiTimeframeData.map((row) => (
+                    {alignedMultiTimeframeData.map((row) => (
                       <tr key={row.symbol}>
                         <td
                           style={{
@@ -3911,6 +3944,18 @@ export default function App() {
                 }}
               >
                 Stock selected for Intraday Analyzer
+                <span
+                  style={{
+                    marginLeft: 8,
+                    padding: "2px 7px",
+                    borderRadius: 999,
+                    background: strategyMode === "INVERSE" ? "#fef3c7" : "#dcfce7",
+                    color: strategyMode === "INVERSE" ? "#92400e" : "#166534",
+                    fontWeight: 900,
+                  }}
+                >
+                  {strategyMode}
+                </span>
               </div>
 
               <div

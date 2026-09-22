@@ -553,10 +553,21 @@ SCANNER_STRATEGY_VERSION = "strict_v3_inverse_test"
 # The original signal and original levels are preserved in the record so the
 # nightly learner can compare original-vs-inverse without hindsight.
 INVERSE_PAPER_TEST_ENABLED = True
+STRATEGY_MODE = "INVERSE" if INVERSE_PAPER_TEST_ENABLED else "NORMAL"
+strategy_mode_lock = threading.Lock()
+
+
+def get_strategy_mode():
+    with strategy_mode_lock:
+        return STRATEGY_MODE
+
+
+def inverse_mode_enabled():
+    return get_strategy_mode() == "INVERSE"
 
 
 def apply_inverse_paper_test(result):
-    if not INVERSE_PAPER_TEST_ENABLED or not isinstance(result, dict):
+    if not inverse_mode_enabled() or not isinstance(result, dict):
         return result
 
     original_signal = str(result.get("signal") or "").upper()
@@ -3494,6 +3505,49 @@ def intraday_history(
 # ============================================================
 
 
+@app.get("/api/intraday/strategy-mode")
+def get_intraday_strategy_mode():
+    mode = get_strategy_mode()
+    return {
+        "mode": mode,
+        "inverse_enabled": mode == "INVERSE",
+        "message": (
+            "Inverse paper-test mode is active."
+            if mode == "INVERSE"
+            else "Normal strategy mode is active."
+        ),
+    }
+
+
+@app.post("/api/intraday/strategy-mode")
+def set_intraday_strategy_mode(mode: str = Query(...)):
+    global STRATEGY_MODE
+
+    requested = str(mode or "").strip().upper()
+    if requested not in {"NORMAL", "INVERSE"}:
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be NORMAL or INVERSE",
+        )
+
+    with strategy_mode_lock:
+        STRATEGY_MODE = requested
+
+    # Do not reuse scanner results generated under the previous strategy mode.
+    scanner_cache.clear()
+
+    return {
+        "ok": True,
+        "mode": requested,
+        "inverse_enabled": requested == "INVERSE",
+        "message": (
+            "Inverse paper-test mode activated."
+            if requested == "INVERSE"
+            else "Normal strategy mode activated."
+        ),
+    }
+
+
 # ============================================================
 # DUAL-TIMEFRAME INTRADAY SCANNER (5m + 15m)
 # ============================================================
@@ -3551,6 +3605,28 @@ def _dual_tf_combine(symbol, result_5m, result_15m):
         final_status = "OBSERVE"
         reason = "Neither timeframe currently has a directional setup."
 
+    # Prefer 5m levels for entry timing when both timeframes agree; otherwise
+    # use the only directional timeframe. These are DISPLAY/diagnostic levels
+    # and do not bypass the executable qualification rules.
+    level_source = {}
+    if actionable_5m:
+        level_source = result_5m or {}
+    elif actionable_15m:
+        level_source = result_15m or {}
+
+    entry_price = (
+        level_source.get("entry_price")
+        or level_source.get("current_price")
+        or level_source.get("price")
+    )
+    stop_loss = level_source.get("stop_loss")
+    target_1 = level_source.get("target_1") or level_source.get("target1")
+    target_2 = level_source.get("target_2") or level_source.get("target2")
+
+    suggested_action = (
+        final_bias if final_bias in {"BUY", "SELL"} else "NO TRADE"
+    )
+
     return {
         "symbol": symbol,
         "strategy_version": SCANNER_STRATEGY_VERSION,
@@ -3562,8 +3638,13 @@ def _dual_tf_combine(symbol, result_5m, result_15m):
         "signal_15m": signal_15m,
         "alignment": alignment,
         "final_bias": final_bias,
+        "suggested_action": suggested_action,
         "final_status": final_status,
         "combined_executable": final_status == "EXECUTABLE",
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "target_1": target_1,
+        "target_2": target_2,
         "combined_reason": reason,
     }
 
@@ -3615,6 +3696,9 @@ def intraday_scanner_multitimeframe(force: bool = False):
         "session_phase": scan_5m.get("session_phase") or scan_15m.get("session_phase"),
         "phase_message": scan_5m.get("phase_message") or scan_15m.get("phase_message"),
         "timestamp": scan_5m.get("timestamp") or scan_15m.get("timestamp"),
+        "count": len(combined),
+        "executable_count": sum(1 for row in combined if row.get("combined_executable")),
+        "watch_count": sum(1 for row in combined if row.get("final_status") == "WATCH"),
         "results": combined,
     }
 
@@ -3943,7 +4027,7 @@ def intraday_scanner(
         "max_qualified_per_day": MAX_QUALIFIED_SUGGESTIONS_PER_DAY,
         "interval": interval,
         "strategy_version": SCANNER_STRATEGY_VERSION,
-        "inverse_paper_test": INVERSE_PAPER_TEST_ENABLED,
+        "inverse_paper_test": inverse_mode_enabled(),
         "inverse_test_note": (
             "Directional BUY/SELL suggestions are intentionally inverted for this paper-test run. "
             "Original signal and levels are preserved in each record."

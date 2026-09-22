@@ -425,6 +425,9 @@ export default function App() {
   const [multiTimeframeLoading, setMultiTimeframeLoading] = useState(false);
   const [multiTimeframeError, setMultiTimeframeError] = useState("");
   const [multiTimeframeUpdatedAt, setMultiTimeframeUpdatedAt] = useState("");
+  const [multiTimeframeMeta, setMultiTimeframeMeta] = useState(null);
+  const [strategyMode, setStrategyMode] = useState("INVERSE");
+  const [strategyModeLoading, setStrategyModeLoading] = useState(false);
 
   const [tradeNotificationsEnabled, setTradeNotificationsEnabled] =
     useState(() => {
@@ -728,7 +731,8 @@ export default function App() {
         }`
       );
 
-      setMultiTimeframeData(data?.results || []);
+      setMultiTimeframeData(Array.isArray(data?.results) ? data.results : []);
+      setMultiTimeframeMeta(data || null);
       setMultiTimeframeUpdatedAt(data?.timestamp || "");
       setMultiTimeframeError("");
     } catch (err) {
@@ -738,6 +742,42 @@ export default function App() {
       );
     } finally {
       setMultiTimeframeLoading(false);
+    }
+  }
+
+  async function loadStrategyMode() {
+    try {
+      const data = await fetchJson(`${BACKEND}/api/intraday/strategy-mode`);
+      setStrategyMode(String(data?.mode || "INVERSE").toUpperCase());
+    } catch (err) {
+      console.error("Strategy mode loading error:", err);
+    }
+  }
+
+  async function switchStrategyMode() {
+    const nextMode = strategyMode === "INVERSE" ? "NORMAL" : "INVERSE";
+    setStrategyModeLoading(true);
+
+    try {
+      const data = await fetchJson(
+        `${BACKEND}/api/intraday/strategy-mode?mode=${encodeURIComponent(nextMode)}`,
+        { method: "POST" }
+      );
+
+      setStrategyMode(String(data?.mode || nextMode).toUpperCase());
+
+      // Immediately rebuild both scanner views under the newly selected mode.
+      await Promise.allSettled([
+        loadScanner(true),
+        loadMultiTimeframeScanner(true),
+      ]);
+    } catch (err) {
+      console.error("Strategy mode switch error:", err);
+      setMultiTimeframeError(
+        err?.message || "Unable to switch strategy mode."
+      );
+    } finally {
+      setStrategyModeLoading(false);
     }
   }
 
@@ -1810,6 +1850,11 @@ export default function App() {
     intradayChartPeriod,
     analysisCategory,
   ]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    loadStrategyMode();
+  }, [isAuthenticated]);
 
   // ==========================================================
   // RELOAD SCANNER WHEN TIMEFRAME CHANGES
@@ -3575,16 +3620,54 @@ export default function App() {
             style={{
               marginBottom: 12,
               padding: "12px 14px",
-              border: "1px solid #f59e0b",
+              border: strategyMode === "INVERSE"
+                ? "1px solid #f59e0b"
+                : "1px solid #16a34a",
               borderRadius: 10,
-              background: "#fffbeb",
-              color: "#92400e",
+              background: strategyMode === "INVERSE" ? "#fffbeb" : "#f0fdf4",
+              color: strategyMode === "INVERSE" ? "#92400e" : "#166534",
               fontWeight: 700,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
             }}
           >
-            INVERSE PAPER TEST ACTIVE — qualified BUY signals are shown as SELL
-            and qualified SELL signals are shown as BUY. Original signals are
-            preserved for learning. New entries stop at 14:30 IST.
+            <div>
+              <strong>
+                {strategyMode === "INVERSE"
+                  ? "INVERSE PAPER TEST ACTIVE"
+                  : "NORMAL STRATEGY ACTIVE"}
+              </strong>
+              {" — "}
+              {strategyMode === "INVERSE"
+                ? "qualified BUY/SELL directions are inverted for the paper-test."
+                : "qualified BUY/SELL directions are shown normally."}
+              {" "}New entries stop at 14:30 IST.
+            </div>
+
+            <button
+              type="button"
+              onClick={switchStrategyMode}
+              disabled={strategyModeLoading}
+              style={{
+                border: "1px solid currentColor",
+                background: "#ffffff",
+                color: "inherit",
+                borderRadius: 8,
+                padding: "8px 12px",
+                fontWeight: 900,
+                cursor: strategyModeLoading ? "not-allowed" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {strategyModeLoading
+                ? "Switching..."
+                : strategyMode === "INVERSE"
+                  ? "Switch to Normal"
+                  : "Switch to Inverse"}
+            </button>
           </div>
         )}
 
@@ -3603,11 +3686,25 @@ export default function App() {
             >
               <div style={{ color: "#64748b", fontSize: 13 }}>
                 Both timeframes are analyzed independently regardless of the
-                selected chart profile. The inverse paper-test direction is
-                displayed after the original setup passes qualification.
+                selected chart profile. Current mode: {strategyMode}.
+                {strategyMode === "INVERSE"
+                  ? " The inverse paper-test direction is displayed after the original setup passes qualification."
+                  : " Qualified directions are displayed normally."}
                 {multiTimeframeUpdatedAt
-                  ? ` Updated: ${multiTimeframeUpdatedAt}`
+                  ? ` Updated: ${formatTradeTimestampIST(multiTimeframeUpdatedAt)}`
                   : ""}
+                <div style={{ marginTop: 5, fontWeight: 700 }}>
+                  Market: {multiTimeframeMeta?.market_status || "—"} • Session:{" "}
+                  {multiTimeframeMeta?.session_phase || "—"} • Rows:{" "}
+                  {multiTimeframeMeta?.count ?? multiTimeframeData.length} • Executable:{" "}
+                  {multiTimeframeMeta?.executable_count ?? 0} • Watch:{" "}
+                  {multiTimeframeMeta?.watch_count ?? 0}
+                </div>
+                {multiTimeframeMeta?.phase_message ? (
+                  <div style={{ marginTop: 4 }}>
+                    {multiTimeframeMeta.phase_message}
+                  </div>
+                ) : null}
               </div>
               <button
                 type="button"
@@ -3639,7 +3736,8 @@ export default function App() {
               </div>
             ) : multiTimeframeData.length === 0 ? (
               <div style={{ color: "#64748b" }}>
-                No multi-timeframe scanner results are available yet.
+                No 5m/15m rows were returned by the backend. Press "Refresh 5m + 15m".
+                If this remains empty, check the backend endpoint and Render deployment.
               </div>
             ) : (
               <div style={{ overflowX: "auto" }}>
@@ -3661,6 +3759,7 @@ export default function App() {
                         "15m Status",
                         "Alignment",
                         "Final",
+                        "Suggested Action",
                         "Action",
                       ].map((heading) => (
                         <th
@@ -3728,20 +3827,46 @@ export default function App() {
                             {row.combined_reason || ""}
                           </div>
                         </td>
+                        <td
+                          style={{
+                            padding: 10,
+                            borderBottom: "1px solid #e2e8f0",
+                            fontWeight: 900,
+                            color:
+                              row.suggested_action === "BUY"
+                                ? "#16a34a"
+                                : row.suggested_action === "SELL"
+                                  ? "#dc2626"
+                                  : "#64748b",
+                          }}
+                        >
+                          {row.suggested_action || row.final_bias || "NO TRADE"}
+                          <div
+                            style={{
+                              fontSize: 11,
+                              marginTop: 3,
+                              color: row.combined_executable ? "#15803d" : "#64748b",
+                            }}
+                          >
+                            {row.combined_executable ? "EXECUTABLE" : "OBSERVE ONLY"}
+                          </div>
+                        </td>
                         <td style={{ padding: 10, borderBottom: "1px solid #e2e8f0" }}>
                           <button
                             type="button"
                             onClick={() => openScannerStock(row.symbol)}
                             style={{
-                              border: "1px solid #cbd5e1",
-                              background: "#ffffff",
+                              border: "1px solid #2563eb",
+                              background: "#2563eb",
+                              color: "#ffffff",
                               borderRadius: 7,
-                              padding: "7px 10px",
-                              fontWeight: 800,
+                              padding: "8px 12px",
+                              fontWeight: 900,
                               cursor: "pointer",
+                              whiteSpace: "nowrap",
                             }}
                           >
-                            Open Chart
+                            Send to Intraday
                           </button>
                         </td>
                       </tr>

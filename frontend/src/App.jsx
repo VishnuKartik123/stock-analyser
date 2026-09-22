@@ -108,16 +108,47 @@ function formatPercent(value) {
   return `${Number(value).toFixed(2)}%`;
 }
 
-// Backend trade timestamps are stored as UTC when no timezone suffix is present.
-// Display trade-history timestamps explicitly in Indian Standard Time (IST).
+// Timestamp policy:
+// 1) New backend records contain an explicit timezone (+05:30) and are parsed normally.
+// 2) Legacy stock_analyser_history.db records are timezone-less but already contain
+//    the IST wall-clock time. For those records, DO NOT append "Z" and DO NOT add
+//    another +05:30. Format the stored date/time components directly as IST.
 function formatTradeTimestampIST(value) {
   if (value === null || value === undefined || value === "") return "—";
 
   const raw = String(value).trim();
   const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw);
-  const normalized = hasTimezone ? raw : `${raw}Z`;
-  const date = new Date(normalized);
 
+  // Legacy SQLite/Render timestamp, e.g. 2026-09-22T15:16:35.036267.
+  // It already represents 15:16:35 IST.
+  if (!hasTimezone) {
+    const match = raw.match(
+      /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2}):(\d{2})/
+    );
+
+    if (match) {
+      const [, year, month, day, hourText, minute, second] = match;
+      const monthNames = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+      ];
+
+      const hour24 = Number(hourText);
+      const hour12 = hour24 % 12 || 12;
+      const dayPeriod = hour24 >= 12 ? "PM" : "AM";
+      const monthName = monthNames[Number(month) - 1] || month;
+
+      return `${day} ${monthName} ${year}, ${String(hour12).padStart(
+        2,
+        "0"
+      )}:${minute}:${second} ${dayPeriod} IST`;
+    }
+
+    return raw;
+  }
+
+  // Timezone-aware timestamps are converted exactly once to Asia/Kolkata.
+  const date = new Date(raw);
   if (Number.isNaN(date.getTime())) return raw;
 
   const parts = new Intl.DateTimeFormat("en-IN", {
@@ -390,6 +421,11 @@ export default function App() {
   const [scannerSessionPhase, setScannerSessionPhase] = useState("—");
   const [scannerPhaseMessage, setScannerPhaseMessage] = useState("");
   const [scannerFilter, setScannerFilter] = useState("ALL");
+  const [multiTimeframeData, setMultiTimeframeData] = useState([]);
+  const [multiTimeframeLoading, setMultiTimeframeLoading] = useState(false);
+  const [multiTimeframeError, setMultiTimeframeError] = useState("");
+  const [multiTimeframeUpdatedAt, setMultiTimeframeUpdatedAt] = useState("");
+
   const [tradeNotificationsEnabled, setTradeNotificationsEnabled] =
     useState(() => {
       if (!("Notification" in window)) return false;
@@ -681,6 +717,30 @@ export default function App() {
     }
   }
 
+  async function loadMultiTimeframeScanner(force = false) {
+    setMultiTimeframeLoading(true);
+    setMultiTimeframeError("");
+
+    try {
+      const data = await fetchJson(
+        `${BACKEND}/api/intraday/scanner-multitimeframe?force=${
+          force ? "true" : "false"
+        }`
+      );
+
+      setMultiTimeframeData(data?.results || []);
+      setMultiTimeframeUpdatedAt(data?.timestamp || "");
+      setMultiTimeframeError("");
+    } catch (err) {
+      console.error("Multi-timeframe scanner error:", err);
+      setMultiTimeframeError(
+        err?.message || "Unable to load 5m + 15m scanner analysis."
+      );
+    } finally {
+      setMultiTimeframeLoading(false);
+    }
+  }
+
   function openScannerStock(stockSymbol) {
     if (!stockSymbol) return;
 
@@ -776,17 +836,32 @@ export default function App() {
   // LOCAL NIGHTLY LEARNING PROFILE
   // ==========================================================
 
-  async function loadLearningProfile() {
+  async function loadLearningProfile(refreshHistory = false) {
     setLearningProfileLoading(true);
 
     try {
+      if (refreshHistory) {
+        await fetchJson(`${BACKEND}/api/learning/refresh`, {
+          method: "POST",
+        });
+      }
+
       const data = await fetchJson(`${BACKEND}/api/learning/profile`);
       setLearningProfile(data);
       setLearningProfileError("");
+
+      // Keep every visible history/account panel in step with the refreshed
+      // archive/runtime data instead of requiring a second manual refresh.
+      await Promise.allSettled([
+        loadIntradayPaperData?.(),
+        loadPaperData?.(),
+        loadScanner?.(true),
+        loadMultiTimeframeScanner?.(true),
+      ]);
     } catch (err) {
-      console.error("Learning profile error:", err);
+      console.error("Learning/history refresh error:", err);
       setLearningProfileError(
-        err?.message || "Unable to load the local learning profile."
+        err?.message || "Unable to refresh history and learning."
       );
     } finally {
       setLearningProfileLoading(false);
@@ -1742,6 +1817,7 @@ export default function App() {
 
   useEffect(() => {
     loadScanner(false);
+    loadMultiTimeframeScanner(false);
   }, [intradayInterval]);
 
   // ==========================================================
@@ -1751,6 +1827,7 @@ export default function App() {
   useEffect(() => {
     const scannerTimer = setInterval(() => {
       loadScanner(false);
+      loadMultiTimeframeScanner(false);
     }, 60000);
 
     return () => clearInterval(scannerTimer);
@@ -3492,6 +3569,190 @@ export default function App() {
             INTRADAY SECTION
         ================================================== */}
 
+
+        {analysisCategory === "INTRADAY" && (
+          <div
+            style={{
+              marginBottom: 12,
+              padding: "12px 14px",
+              border: "1px solid #f59e0b",
+              borderRadius: 10,
+              background: "#fffbeb",
+              color: "#92400e",
+              fontWeight: 700,
+            }}
+          >
+            INVERSE PAPER TEST ACTIVE — qualified BUY signals are shown as SELL
+            and qualified SELL signals are shown as BUY. Original signals are
+            preserved for learning. New entries stop at 14:30 IST.
+          </div>
+        )}
+
+        {/* Always-on 5m + 15m scanner */}
+        {analysisCategory === "INTRADAY" && (
+          <Card title="5m + 15m Multi-Timeframe Suggestions">
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 10,
+                flexWrap: "wrap",
+                marginBottom: 12,
+              }}
+            >
+              <div style={{ color: "#64748b", fontSize: 13 }}>
+                Both timeframes are analyzed independently regardless of the
+                selected chart profile. The inverse paper-test direction is
+                displayed after the original setup passes qualification.
+                {multiTimeframeUpdatedAt
+                  ? ` Updated: ${multiTimeframeUpdatedAt}`
+                  : ""}
+              </div>
+              <button
+                type="button"
+                onClick={() => loadMultiTimeframeScanner(true)}
+                disabled={multiTimeframeLoading}
+                style={{
+                  border: "1px solid #cbd5e1",
+                  background: "#f8fafc",
+                  borderRadius: 8,
+                  padding: "8px 12px",
+                  fontWeight: 800,
+                  cursor: multiTimeframeLoading ? "default" : "pointer",
+                }}
+              >
+                {multiTimeframeLoading ? "Scanning..." : "Refresh 5m + 15m"}
+              </button>
+            </div>
+
+            {multiTimeframeError ? (
+              <div
+                style={{
+                  background: "#fee2e2",
+                  color: "#991b1b",
+                  padding: 10,
+                  borderRadius: 8,
+                }}
+              >
+                {multiTimeframeError}
+              </div>
+            ) : multiTimeframeData.length === 0 ? (
+              <div style={{ color: "#64748b" }}>
+                No multi-timeframe scanner results are available yet.
+              </div>
+            ) : (
+              <div style={{ overflowX: "auto" }}>
+                <table
+                  style={{
+                    width: "100%",
+                    borderCollapse: "collapse",
+                    minWidth: 900,
+                    fontSize: 13,
+                  }}
+                >
+                  <thead>
+                    <tr style={{ background: "#f8fafc", textAlign: "left" }}>
+                      {[
+                        "Stock",
+                        "5m",
+                        "5m Status",
+                        "15m",
+                        "15m Status",
+                        "Alignment",
+                        "Final",
+                        "Action",
+                      ].map((heading) => (
+                        <th
+                          key={heading}
+                          style={{
+                            padding: 10,
+                            borderBottom: "1px solid #e2e8f0",
+                            color: "#475569",
+                          }}
+                        >
+                          {heading}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {multiTimeframeData.map((row) => (
+                      <tr key={row.symbol}>
+                        <td
+                          style={{
+                            padding: 10,
+                            borderBottom: "1px solid #e2e8f0",
+                            fontWeight: 900,
+                          }}
+                        >
+                          {row.symbol}
+                        </td>
+                        <td style={{ padding: 10, borderBottom: "1px solid #e2e8f0" }}>
+                          <StatusBadge signal={row.signal_5m} />
+                        </td>
+                        <td style={{ padding: 10, borderBottom: "1px solid #e2e8f0" }}>
+                          {row.status_5m || "OBSERVE"}
+                        </td>
+                        <td style={{ padding: 10, borderBottom: "1px solid #e2e8f0" }}>
+                          <StatusBadge signal={row.signal_15m} />
+                        </td>
+                        <td style={{ padding: 10, borderBottom: "1px solid #e2e8f0" }}>
+                          {row.status_15m || "OBSERVE"}
+                        </td>
+                        <td
+                          style={{
+                            padding: 10,
+                            borderBottom: "1px solid #e2e8f0",
+                            fontWeight: 800,
+                          }}
+                        >
+                          {row.alignment || "NONE"}
+                        </td>
+                        <td
+                          style={{
+                            padding: 10,
+                            borderBottom: "1px solid #e2e8f0",
+                            fontWeight: 900,
+                          }}
+                        >
+                          {row.final_status || "OBSERVE"}
+                          <div
+                            style={{
+                              marginTop: 4,
+                              fontWeight: 400,
+                              color: "#64748b",
+                              maxWidth: 260,
+                            }}
+                          >
+                            {row.combined_reason || ""}
+                          </div>
+                        </td>
+                        <td style={{ padding: 10, borderBottom: "1px solid #e2e8f0" }}>
+                          <button
+                            type="button"
+                            onClick={() => openScannerStock(row.symbol)}
+                            style={{
+                              border: "1px solid #cbd5e1",
+                              background: "#ffffff",
+                              borderRadius: 7,
+                              padding: "7px 10px",
+                              fontWeight: 800,
+                              cursor: "pointer",
+                            }}
+                          >
+                            Open Chart
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        )}
+
         <div id="intraday-full-analysis">
         <Card
           title="Intraday Buy / Sell Analyzer"
@@ -5169,9 +5430,9 @@ export default function App() {
                       key={trade.id || `${trade.symbol || "trade"}-${index}`}
                     >
                       <td style={tdStyle}>
-                        {trade.timestamp ||
-                          trade.time ||
-                          "—"}
+                        {formatTradeTimestampIST(
+                          trade.timestamp || trade.time
+                        )}
                       </td>
 
                       <td style={tdStyle}>
@@ -5485,16 +5746,16 @@ export default function App() {
             >
               <div>
                 <div style={{ fontSize: 16, fontWeight: 900, color: "#0f172a" }}>
-                  Local Learning / Training
+                  Learning / Training
                 </div>
                 <div style={{ fontSize: 12, color: "#64748b", marginTop: 3 }}>
-                  Latest nightly Render → local learning profile
+                  Refresh updates history first, then rebuilds the learning profile
                 </div>
               </div>
 
               <button
                 type="button"
-                onClick={loadLearningProfile}
+                onClick={() => loadLearningProfile(true)}
                 disabled={learningProfileLoading}
                 style={{
                   border: "1px solid #cbd5e1",
@@ -5506,7 +5767,7 @@ export default function App() {
                   cursor: learningProfileLoading ? "default" : "pointer",
                 }}
               >
-                {learningProfileLoading ? "Refreshing..." : "Refresh Learning"}
+                {learningProfileLoading ? "Syncing History..." : "Refresh Learning + History"}
               </button>
             </div>
 
@@ -5711,6 +5972,10 @@ export default function App() {
               [
                 "Margin Used",
                 formatMoney(dayTradeAccount?.margin_used ?? 0),
+              ],
+              [
+                "Realized P&L",
+                formatMoney(dayTradeAccount?.realized_pnl ?? 0),
               ],
               [
                 "Unrealized P&L",

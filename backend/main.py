@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import json
 import sqlite3
+import subprocess
+import sys
 import os
 import hmac
 import hashlib
@@ -498,9 +500,9 @@ intraday_paper_trades = load_intraday_trade_history()
 #
 # Daily operating plan (India time):
 #   09:15-09:45  -> observe only; never qualify a new suggestion
-#   09:45-14:45  -> normal strict qualification
-#   14:45-15:15  -> conservative qualification
-#   15:15-15:30  -> no new suggestions; manage open positions only
+#   09:45-13:30  -> normal strict qualification
+#   13:30-14:30  -> conservative qualification
+#   14:30-15:30  -> no new suggestions; manage open positions only
 #   after 15:30  -> evaluate saved candidates and create a daily review
 #
 # The learning layer is intentionally conservative. It never "learns" from
@@ -518,8 +520,8 @@ QUALIFIED_MIN_VOLUME_RATIO = 1.20
 
 # Avoid the opening noise and stop initiating trades earlier in the afternoon.
 MARKET_SETTLED_MINUTES = 9 * 60 + 45
-LATE_SESSION_START_MINUTES = 14 * 60 + 15
-NEW_ENTRY_CUTOFF_MINUTES = 14 * 60 + 45
+LATE_SESSION_START_MINUTES = 13 * 60 + 30
+NEW_ENTRY_CUTOFF_MINUTES = 14 * 60 + 30
 
 # Late-session entries must be exceptional.
 LATE_QUALIFIED_MIN_SCORE = 9
@@ -536,7 +538,75 @@ HISTORICAL_MIN_SAMPLE = 20
 HISTORICAL_MIN_SUCCESS_RATE = 0.45
 
 # Version tag stored with every new scanner observation.
-SCANNER_STRATEGY_VERSION = "strict_v2"
+SCANNER_STRATEGY_VERSION = "strict_v3_inverse_test"
+
+
+
+# ============================================================
+# INVERSE PAPER-TRADING EXPERIMENT
+# ============================================================
+# Diagnostic experiment only:
+#   original BUY  -> surfaced/stored as SELL
+#   original SELL -> surfaced/stored as BUY
+# WAIT / NO TRADE remain unchanged.
+#
+# The original signal and original levels are preserved in the record so the
+# nightly learner can compare original-vs-inverse without hindsight.
+INVERSE_PAPER_TEST_ENABLED = True
+
+
+def apply_inverse_paper_test(result):
+    if not INVERSE_PAPER_TEST_ENABLED or not isinstance(result, dict):
+        return result
+
+    original_signal = str(result.get("signal") or "").upper()
+    if original_signal not in ("BUY", "SELL"):
+        result["inverse_experiment"] = False
+        return result
+
+    entry = safe_float(result.get("entry_price") or result.get("current_price") or result.get("price"))
+    stop = safe_float(result.get("stop_loss"))
+    target1 = safe_float(result.get("target_1") or result.get("target1"))
+    target2 = safe_float(result.get("target_2") or result.get("target2"))
+
+    # Preserve the complete original recommendation before mirroring it.
+    result["inverse_experiment"] = True
+    result["source_strategy_version"] = result.get("strategy_version") or "strict_v3"
+    result["strategy_version"] = SCANNER_STRATEGY_VERSION
+    result["original_signal"] = original_signal
+    result["original_entry_price"] = entry
+    result["original_stop_loss"] = stop
+    result["original_target_1"] = target1
+    result["original_target_2"] = target2
+
+    if entry is None:
+        # Never manufacture levels when the source setup itself is incomplete.
+        result["signal"] = "NO TRADE"
+        result["qualified"] = False
+        result["executable"] = False
+        result["qualification_level"] = "NONE"
+        result["inverse_reason"] = "Inverse test blocked because source entry is unavailable."
+        return result
+
+    inverse_signal = "SELL" if original_signal == "BUY" else "BUY"
+    result["signal"] = inverse_signal
+
+    # Mirror each source level around the same entry. This keeps the original
+    # risk/target distances while producing valid geometry for the opposite side.
+    if stop is not None:
+        result["stop_loss"] = round(2.0 * entry - stop, 2)
+    if target1 is not None:
+        result["target_1"] = round(2.0 * entry - target1, 2)
+        result["target1"] = result["target_1"]
+    if target2 is not None:
+        result["target_2"] = round(2.0 * entry - target2, 2)
+        result["target2"] = result["target_2"]
+
+    result["inverse_reason"] = (
+        f"Paper-test inversion: source {original_signal} was qualified first; "
+        f"experimental suggestion is {inverse_signal} with mirrored risk/target distances."
+    )
+    return result
 
 
 def init_scanner_signal_db():
@@ -3423,6 +3493,132 @@ def intraday_history(
 # INTRADAY SCANNER
 # ============================================================
 
+
+# ============================================================
+# DUAL-TIMEFRAME INTRADAY SCANNER (5m + 15m)
+# ============================================================
+
+def _dual_tf_status(result):
+    if not isinstance(result, dict):
+        return "OBSERVE"
+    signal = str(result.get("signal") or "WAIT").upper()
+    executable = bool(result.get("executable"))
+    strict = bool(result.get("strict_qualified"))
+    qualified = bool(result.get("qualified"))
+    score = float(result.get("setup_quality") or result.get("score") or 0.0)
+    if executable and signal in {"BUY", "SELL"}:
+        return "EXECUTABLE"
+    if strict and signal in {"BUY", "SELL"}:
+        return "STRICT QUALIFIED"
+    if qualified and signal in {"BUY", "SELL"}:
+        return "NEAR QUALIFIED"
+    if signal in {"BUY", "SELL"} or score >= 6:
+        return "WATCH"
+    return "OBSERVE"
+
+
+def _dual_tf_combine(symbol, result_5m, result_15m):
+    signal_5m = str((result_5m or {}).get("signal") or "WAIT").upper()
+    signal_15m = str((result_15m or {}).get("signal") or "WAIT").upper()
+    actionable_5m = signal_5m in {"BUY", "SELL"}
+    actionable_15m = signal_15m in {"BUY", "SELL"}
+
+    if actionable_5m and actionable_15m and signal_5m == signal_15m:
+        alignment = "ALIGNED"
+        final_bias = signal_5m
+        both_executable = bool((result_5m or {}).get("executable")) and bool(
+            (result_15m or {}).get("executable")
+        )
+        final_status = "EXECUTABLE" if both_executable else "WATCH"
+        reason = (
+            "5m and 15m agree and both passed executable filters."
+            if both_executable
+            else "5m and 15m agree, but both timeframes have not passed every executable filter."
+        )
+    elif actionable_5m and actionable_15m and signal_5m != signal_15m:
+        alignment = "CONFLICT"
+        final_bias = "NO TRADE"
+        final_status = "NO TRADE"
+        reason = "5m and 15m point in opposite directions."
+    elif actionable_5m or actionable_15m:
+        alignment = "PARTIAL"
+        final_bias = signal_5m if actionable_5m else signal_15m
+        final_status = "WATCH"
+        reason = "Only one timeframe currently has a directional setup."
+    else:
+        alignment = "NONE"
+        final_bias = "WAIT"
+        final_status = "OBSERVE"
+        reason = "Neither timeframe currently has a directional setup."
+
+    return {
+        "symbol": symbol,
+        "strategy_version": SCANNER_STRATEGY_VERSION,
+        "analysis_5m": result_5m,
+        "analysis_15m": result_15m,
+        "status_5m": _dual_tf_status(result_5m),
+        "status_15m": _dual_tf_status(result_15m),
+        "signal_5m": signal_5m,
+        "signal_15m": signal_15m,
+        "alignment": alignment,
+        "final_bias": final_bias,
+        "final_status": final_status,
+        "combined_executable": final_status == "EXECUTABLE",
+        "combined_reason": reason,
+    }
+
+
+@app.get("/api/intraday/scanner-multitimeframe")
+def intraday_scanner_multitimeframe(force: bool = False):
+    """
+    Always evaluate both 5m and 15m, independent of the chart/profile selector.
+
+    This composes the existing scanner twice so all existing qualification,
+    persistence, market-regime, circuit-breaker and learning logic remains
+    centralized in the normal scanner endpoint.
+    """
+    scan_5m = intraday_scanner(interval="5m", force=force)
+    scan_15m = intraday_scanner(interval="15m", force=force)
+
+    results_5m = {
+        str(item.get("symbol") or "").upper(): item
+        for item in (scan_5m.get("results") or [])
+        if isinstance(item, dict) and item.get("symbol")
+    }
+    results_15m = {
+        str(item.get("symbol") or "").upper(): item
+        for item in (scan_15m.get("results") or [])
+        if isinstance(item, dict) and item.get("symbol")
+    }
+
+    symbols = sorted(set(results_5m) | set(results_15m))
+    combined = [
+        _dual_tf_combine(symbol, results_5m.get(symbol, {}), results_15m.get(symbol, {}))
+        for symbol in symbols
+    ]
+
+    # Most useful rows first, without turning weaker single-timeframe setups
+    # into executable suggestions.
+    priority = {"EXECUTABLE": 0, "WATCH": 1, "OBSERVE": 2, "NO TRADE": 3}
+    combined.sort(
+        key=lambda row: (
+            priority.get(row.get("final_status"), 9),
+            row.get("symbol") or "",
+        )
+    )
+
+    return {
+        "strategy_version": SCANNER_STRATEGY_VERSION,
+        "timeframes": ["5m", "15m"],
+        "selected_profile_independent": True,
+        "market_status": scan_5m.get("market_status") or scan_15m.get("market_status"),
+        "session_phase": scan_5m.get("session_phase") or scan_15m.get("session_phase"),
+        "phase_message": scan_5m.get("phase_message") or scan_15m.get("phase_message"),
+        "timestamp": scan_5m.get("timestamp") or scan_15m.get("timestamp"),
+        "results": combined,
+    }
+
+
 @app.get("/api/intraday/scanner")
 def intraday_scanner(
     force: bool = Query(False),
@@ -3596,6 +3792,12 @@ def intraday_scanner(
         if qualified:
             result["qualification_level"] = "CONFIRMED"
 
+    # Diagnostic inverse paper test:
+    # qualify the source setup using the normal strict rules first, then mirror
+    # only the surfaced/stored directional recommendation.
+    for result in ranked:
+        apply_inverse_paper_test(result)
+
     # Strict setups always have first priority.
     for result in ranked:
         if result.get("qualification_level") != "CONFIRMED":
@@ -3719,10 +3921,10 @@ def intraday_scanner(
         ),
         "NORMAL_SCAN": "Normal qualified scanning is active.",
         "CONSERVATIVE_SCAN": (
-            "Late session: stronger qualification thresholds are active."
+            "13:30-14:30 IST: conservative scan; stronger qualification thresholds are active."
         ),
         "NO_NEW_ENTRIES": (
-            "No new suggestions after 15:15 IST. "
+            "No new suggestions after 14:30 IST. "
             "Manage existing positions only."
         ),
         "END_OF_DAY": (
@@ -3740,6 +3942,13 @@ def intraday_scanner(
         "qualified_today": scanner_signal_count_today(),
         "max_qualified_per_day": MAX_QUALIFIED_SUGGESTIONS_PER_DAY,
         "interval": interval,
+        "strategy_version": SCANNER_STRATEGY_VERSION,
+        "inverse_paper_test": INVERSE_PAPER_TEST_ENABLED,
+        "inverse_test_note": (
+            "Directional BUY/SELL suggestions are intentionally inverted for this paper-test run. "
+            "Original signal and levels are preserved in each record."
+        ),
+        "new_entry_cutoff_ist": "14:30",
         "count": len(results),
         "buy_count": len(buys),
         "sell_count": len(sells),
@@ -3803,6 +4012,165 @@ def intraday_learning_summary():
 
 
 # ============================================================
+# LOCAL LEARNING PROFILE
+# ============================================================
+
+LEARNING_PROFILE_PATH = Path(
+    os.getenv(
+        "LEARNING_PROFILE_PATH",
+        str(Path(__file__).resolve().parent / "learning_profile.json"),
+    )
+)
+
+
+@app.get("/api/learning/profile")
+def learning_profile():
+    """
+    Return the latest profile produced by nightly_sync.py.
+
+    The local frontend can use this endpoint to display the same learning
+    statistics that are printed after the nightly Render -> local sync.
+    """
+    if not LEARNING_PROFILE_PATH.exists():
+        return {
+            "available": False,
+            "message": "No local learning profile has been generated yet.",
+            "path": str(LEARNING_PROFILE_PATH),
+        }
+
+    try:
+        profile = json.loads(
+            LEARNING_PROFILE_PATH.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to read learning profile: {exc}",
+        )
+
+    if not isinstance(profile, dict):
+        raise HTTPException(
+            status_code=500,
+            detail="Learning profile is not a valid JSON object.",
+        )
+
+    return {
+        "available": True,
+        "path": str(LEARNING_PROFILE_PATH),
+        **profile,
+    }
+
+
+def _is_render_runtime():
+    return bool(
+        os.getenv("RENDER")
+        or os.getenv("RENDER_SERVICE_ID")
+        or os.getenv("RENDER_EXTERNAL_URL")
+        or os.getenv("RENDER_SERVICE_NAME")
+    )
+
+
+@app.post("/api/learning/refresh")
+def refresh_learning():
+    """
+    Refresh history + learning with one button.
+
+    LOCAL:
+      Runs nightly_sync.py, which downloads the latest Render export into the
+      permanent local SQLite archive and rebuilds learning_profile.json.
+
+    RENDER:
+      Rebuilds learning_profile.json directly from the Render service's current
+      SQLite history. A cloud service cannot write directly into the user's
+      Windows SQLite file, so the local archive is updated the next time the
+      same button is pressed on localhost.
+    """
+    if _is_render_runtime():
+        try:
+            from nightly_sync import build_learning_profile, save_learning_profile
+
+            with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+                profile = build_learning_profile(connection)
+            save_learning_profile(profile)
+
+            return {
+                "ok": True,
+                "mode": "render",
+                "history_updated": True,
+                "learning_updated": True,
+                "message": "Render history/profile refreshed from the current Render database.",
+                "profile": profile,
+            }
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to refresh Render learning profile: {exc}",
+            )
+
+    script = Path(__file__).resolve().parent / "nightly_sync.py"
+    if not script.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="nightly_sync.py is missing from the backend folder.",
+        )
+
+    # The web request cannot answer interactive username/password prompts.
+    # Keep credentials in backend/.env (local) and Render Environment (cloud).
+    if not os.getenv("APP_USERNAME") or not os.getenv("APP_PASSWORD"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Automatic Render -> local refresh requires APP_USERNAME and "
+                "APP_PASSWORD in backend/.env. No history was changed."
+            ),
+        )
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail="Render -> local synchronization timed out.",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to start nightly synchronization: {exc}",
+        )
+
+    output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+    if completed.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Learning/history refresh failed: {output[-3000:]}",
+        )
+
+    profile = None
+    if LEARNING_PROFILE_PATH.exists():
+        try:
+            profile = json.loads(LEARNING_PROFILE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            profile = None
+
+    return {
+        "ok": True,
+        "mode": "local",
+        "history_updated": True,
+        "learning_updated": True,
+        "message": "Render history synchronized to local SQLite and learning rebuilt.",
+        "profile": profile,
+        "sync_output": output[-5000:],
+    }
+
+
+# ============================================================
 # HEALTH
 # ============================================================
 
@@ -3824,7 +4192,7 @@ def health():
             True,
 
         "time":
-            datetime.now().isoformat(),
+            datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
     }
 
 
@@ -4638,7 +5006,7 @@ def place_order(
             uuid.uuid4().hex,
 
         "timestamp":
-            datetime.now().isoformat(),
+            datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
 
         "symbol":
             symbol,
@@ -4774,17 +5142,35 @@ def get_intraday_paper_account():
         else:
             unrealized_pnl += (avg - ltp) * abs(qty)
 
-    balance = float(intraday_paper_account["balance"])
-    available_margin = max(0.0, balance - margin_used)
+    # Use the durable trade ledger as the single source of truth for realized
+    # P&L. This keeps the account card synchronized with nightly_sync.py even
+    # after Render -> local trade imports or a backend restart.
+    durable_trades = load_intraday_trade_history()
+    realized_pnl = sum(
+        safe_float(trade.get("realized_pnl")) or 0.0
+        for trade in durable_trades
+    )
+    starting_balance = float(
+        intraday_paper_account.get("starting_balance", INTRADAY_STARTING_BALANCE)
+    )
+    balance = starting_balance + realized_pnl
+
+    # Repair a stale runtime snapshot in memory. Open positions and pending
+    # orders remain untouched; only the realized account balance is reconciled.
+    intraday_paper_account["balance"] = balance
+
+    equity = balance + unrealized_pnl
+    available_margin = max(0.0, equity - margin_used)
 
     return {
-        "starting_balance": intraday_paper_account["starting_balance"],
+        "starting_balance": starting_balance,
         "balance": balance,
+        "realized_pnl": realized_pnl,
         "cash": available_margin,
         "available_margin": available_margin,
         "margin_used": margin_used,
         "unrealized_pnl": unrealized_pnl,
-        "equity": balance + unrealized_pnl,
+        "equity": equity,
         "gross_exposure": gross_exposure,
         "margin_rate": INTRADAY_MARGIN_RATE,
         "margin_percent": INTRADAY_MARGIN_RATE * 100.0,
@@ -5131,7 +5517,7 @@ def place_intraday_paper_order(order: OrderRequest):
         if not exact_match:
             pending_order = {
                 "id": uuid.uuid4().hex,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
                 "symbol": symbol,
                 "side": side,
                 "quantity": quantity,
@@ -5334,7 +5720,7 @@ def place_intraday_paper_order(order: OrderRequest):
 
     trade = {
         "id": uuid.uuid4().hex,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
         "symbol": symbol,
         "side": side,
         "quantity": quantity,

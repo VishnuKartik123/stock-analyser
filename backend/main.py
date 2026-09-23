@@ -462,6 +462,7 @@ def _rebuild_intraday_runtime_from_trade_history():
             "margin_used": abs(new_qty) * avg * INTRADAY_MARGIN_RATE,
             "exit_target": None,
             "stop_loss": safe_float(trade.get("stop_loss")),
+            "strategy_mode": str(trade.get("strategy_mode") or "LEGACY").upper(),
         }
     return balance, positions
 
@@ -513,10 +514,13 @@ intraday_paper_trades = load_intraday_trade_history()
 # LOSS-REDUCTION MODE
 # The scanner remains active and continues learning from rejected candidates,
 # but live suggestions require materially stronger evidence.
-MAX_QUALIFIED_SUGGESTIONS_PER_DAY = 2
-QUALIFIED_MIN_SCORE = 8
+MAX_QUALIFIED_SUGGESTIONS_PER_DAY = 1
+QUALIFIED_MIN_SCORE = 6
 QUALIFIED_MIN_RISK_REWARD = 1.80
-QUALIFIED_MIN_VOLUME_RATIO = 1.20
+# Historical observations showed that very high volume was associated with
+# more stop-first outcomes. Use a band rather than rewarding ever-higher volume.
+QUALIFIED_MIN_VOLUME_RATIO = 0.80
+QUALIFIED_MAX_VOLUME_RATIO = 1.60
 
 # Avoid the opening noise and stop initiating trades earlier in the afternoon.
 MARKET_SETTLED_MINUTES = 9 * 60 + 45
@@ -524,21 +528,30 @@ LATE_SESSION_START_MINUTES = 13 * 60 + 30
 NEW_ENTRY_CUTOFF_MINUTES = 14 * 60 + 30
 
 # Late-session entries must be exceptional.
-LATE_QUALIFIED_MIN_SCORE = 9
+LATE_QUALIFIED_MIN_SCORE = 7
 LATE_QUALIFIED_MIN_RISK_REWARD = 2.00
-LATE_QUALIFIED_MIN_VOLUME_RATIO = 1.30
+LATE_QUALIFIED_MIN_VOLUME_RATIO = 0.90
+LATE_QUALIFIED_MAX_VOLUME_RATIO = 1.40
 
 # Portfolio-level defensive limits for the ₹1,00,000 paper account.
-MAX_DAILY_REALIZED_LOSS = 750.0
+MAX_DAILY_REALIZED_LOSS = 400.0
 MAX_CONSECUTIVE_LOSSES = 2
 
 # Do not use historical performance as a gate until enough resolved examples
 # exist. This avoids overfitting a handful of trades.
 HISTORICAL_MIN_SAMPLE = 20
-HISTORICAL_MIN_SUCCESS_RATE = 0.45
+HISTORICAL_MIN_SUCCESS_RATE = 0.35
 
 # Version tag stored with every new scanner observation.
-SCANNER_STRATEGY_VERSION = "strict_v3_inverse_test"
+SCANNER_STRATEGY_VERSION = "two_day_shadow_v5"
+SHADOW_EXPERIMENT_ENABLED = True
+SHADOW_VARIANTS = (
+    "A_EVIDENCE_GUARD",
+    "B_5M_EVIDENCE",
+    "C_REDUCED_CONFIRMATION",
+    "D_15M_OBSERVATION",
+    "E_INVERSE_SHADOW",
+)
 
 
 
@@ -552,7 +565,7 @@ SCANNER_STRATEGY_VERSION = "strict_v3_inverse_test"
 #
 # The original signal and original levels are preserved in the record so the
 # nightly learner can compare original-vs-inverse without hindsight.
-INVERSE_PAPER_TEST_ENABLED = True
+INVERSE_PAPER_TEST_ENABLED = False
 STRATEGY_MODE = "INVERSE" if INVERSE_PAPER_TEST_ENABLED else "NORMAL"
 strategy_mode_lock = threading.Lock()
 
@@ -704,7 +717,7 @@ def store_qualified_signal(result):
 
 
 def store_scanner_candidate(result):
-    """Persist the latest BUY/SELL candidate snapshot for later evaluation."""
+    """Persist a BUY/SELL candidate snapshot for later evaluation."""
     init_scanner_signal_db()
 
     signal = str(result.get("signal", "")).upper()
@@ -714,41 +727,78 @@ def store_scanner_candidate(result):
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     day = now.date().isoformat()
     symbol = clean_symbol(result.get("symbol", ""))
-    candidate_id = f"{day}:{symbol}:{signal}"
+
+    strategy_mode = str(
+        result.get("strategy_mode")
+        or ("INVERSE" if result.get("inverse_experiment") is True else get_strategy_mode())
+    ).upper()
+    if strategy_mode not in ("NORMAL", "INVERSE"):
+        strategy_mode = "LEGACY/UNKNOWN"
+
+    interval = str(result.get("interval") or result.get("timeframe") or "UNKNOWN").lower().strip()
+    if not interval:
+        interval = "unknown"
+
+    candidate_id = f"{day}:{symbol}:{signal}:{strategy_mode}:{interval}:{SCANNER_STRATEGY_VERSION}"
+    indicators = result.get("indicators") or {}
 
     snapshot = dict(result)
     snapshot["candidate_id"] = candidate_id
     snapshot["captured_at"] = now.isoformat()
-    snapshot["strategy_version"] = str(
-        result.get("strategy_version") or SCANNER_STRATEGY_VERSION
+    snapshot["strategy_mode"] = strategy_mode
+    snapshot["strategy_version"] = str(result.get("strategy_version") or SCANNER_STRATEGY_VERSION)
+    snapshot["interval"] = interval
+    snapshot["timeframe"] = interval
+    snapshot["original_side"] = str(result.get("original_signal") or signal).upper()
+    snapshot["executed_side"] = signal
+    snapshot["inverse_experiment"] = bool(
+        result.get("inverse_experiment") is True or strategy_mode == "INVERSE"
     )
-    snapshot["interval"] = str(
-        result.get("interval") or result.get("timeframe") or "UNKNOWN"
+    snapshot["entry_time"] = str(
+        result.get("entry_time") or result.get("last_candle") or
+        result.get("last_update") or now.isoformat()
     )
-    snapshot["timeframe"] = snapshot["interval"]
+    snapshot["entry_price"] = safe_float(
+        result.get("entry_price") if result.get("entry_price") is not None
+        else result.get("current_price")
+    )
+    snapshot["stop_loss"] = safe_float(result.get("stop_loss"))
+    snapshot["target_1"] = safe_float(result.get("target_1") or result.get("target1"))
+    snapshot["target_2"] = safe_float(result.get("target_2") or result.get("target2"))
+    snapshot["risk_reward"] = safe_float(result.get("risk_reward"))
+    snapshot["setup_quality"] = safe_float(
+        result.get("setup_quality") if result.get("setup_quality") is not None
+        else result.get("quality")
+    )
+    snapshot["score"] = safe_float(result.get("score"))
+    snapshot["rsi14"] = safe_float(result.get("rsi14") if result.get("rsi14") is not None else indicators.get("rsi14"))
+    snapshot["ema9"] = safe_float(result.get("ema9") if result.get("ema9") is not None else indicators.get("ema9"))
+    snapshot["ema20"] = safe_float(result.get("ema20") if result.get("ema20") is not None else indicators.get("ema20"))
+    snapshot["vwap"] = safe_float(result.get("vwap") if result.get("vwap") is not None else indicators.get("vwap"))
+    snapshot["volume_ratio"] = safe_float(
+        result.get("volume_ratio") if result.get("volume_ratio") is not None
+        else indicators.get("volume_ratio")
+    )
+    snapshot["macd"] = safe_float(result.get("macd") if result.get("macd") is not None else indicators.get("macd"))
+    snapshot["macd_signal"] = safe_float(
+        result.get("macd_signal") if result.get("macd_signal") is not None
+        else indicators.get("macd_signal")
+    )
+    snapshot["atr14"] = safe_float(result.get("atr14") if result.get("atr14") is not None else indicators.get("atr14"))
     snapshot["strict_qualified"] = bool(result.get("strict_qualified"))
     snapshot["executable"] = bool(result.get("executable"))
-    snapshot["rsi14"] = safe_float(
-        result.get("rsi14")
-        if result.get("rsi14") is not None
-        else (result.get("indicators") or {}).get("rsi14")
-    )
+    snapshot["shadow_experiment_enabled"] = SHADOW_EXPERIMENT_ENABLED
+    snapshot["shadow_variants"] = result.get("shadow_variants") or {}
+    snapshot["shadow_watch"] = result.get("shadow_watch") or {}
+
     regime = result.get("market_regime")
-    snapshot["market_regime"] = regime if isinstance(regime, dict) else {
-        "regime": str(regime or "UNKNOWN")
-    }
+    snapshot["market_regime"] = regime if isinstance(regime, dict) else {"regime": str(regime or "UNKNOWN")}
 
     with sqlite3.connect(TRADE_HISTORY_DB) as connection:
         existing = connection.execute(
-            """
-            SELECT resolved
-            FROM scanner_candidate_history
-            WHERE id=?
-            """,
+            "SELECT resolved FROM scanner_candidate_history WHERE id=?",
             (candidate_id,),
         ).fetchone()
-
-        # Never overwrite an already resolved historical observation.
         if existing and int(existing[0] or 0) == 1:
             return candidate_id
 
@@ -763,11 +813,7 @@ def store_scanner_candidate(result):
                 candidate_json=excluded.candidate_json
             """,
             (
-                candidate_id,
-                day,
-                now.isoformat(),
-                symbol,
-                signal,
+                candidate_id, day, now.isoformat(), symbol, signal,
                 1 if result.get("qualified") is True else 0,
                 json.dumps(snapshot, ensure_ascii=False, default=str),
             ),
@@ -775,6 +821,73 @@ def store_scanner_candidate(result):
         connection.commit()
 
     return candidate_id
+
+
+def latest_scanner_execution_context(symbol, side, strategy_mode):
+    """Return the newest same-day scanner context matching this execution."""
+    init_scanner_signal_db()
+    symbol = clean_symbol(symbol)
+    side = str(side or "").upper()
+    strategy_mode = str(strategy_mode or "").upper()
+    day = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+
+    with sqlite3.connect(TRADE_HISTORY_DB) as connection:
+        rows = connection.execute(
+            """
+            SELECT candidate_json
+            FROM scanner_candidate_history
+            WHERE trade_date=? AND symbol=? AND side=?
+            ORDER BY timestamp DESC
+            LIMIT 20
+            """,
+            (day, symbol, side),
+        ).fetchall()
+
+    for (raw,) in rows:
+        try:
+            candidate = json.loads(raw or "{}")
+        except Exception:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+
+        candidate_mode = str(
+            candidate.get("strategy_mode")
+            or ("INVERSE" if candidate.get("inverse_experiment") is True else "")
+        ).upper()
+        if strategy_mode in ("NORMAL", "INVERSE") and candidate_mode != strategy_mode:
+            continue
+
+        return {
+            "candidate_id": candidate.get("candidate_id"),
+            "strategy_version": candidate.get("strategy_version"),
+            "strategy_mode": candidate_mode or strategy_mode or "LEGACY/UNKNOWN",
+            "interval": candidate.get("interval") or candidate.get("timeframe") or "UNKNOWN",
+            "original_side": candidate.get("original_side") or candidate.get("original_signal") or side,
+            "executed_side": candidate.get("executed_side") or candidate.get("signal") or side,
+            "entry_time": candidate.get("entry_time") or candidate.get("captured_at"),
+            "suggested_entry_price": safe_float(candidate.get("entry_price")),
+            "suggested_stop_loss": safe_float(candidate.get("stop_loss")),
+            "target_1": safe_float(candidate.get("target_1") or candidate.get("target1")),
+            "target_2": safe_float(candidate.get("target_2") or candidate.get("target2")),
+            "risk_reward": safe_float(candidate.get("risk_reward")),
+            "setup_quality": safe_float(candidate.get("setup_quality") or candidate.get("quality")),
+            "score": safe_float(candidate.get("score")),
+            "rsi14": safe_float(candidate.get("rsi14")),
+            "ema9": safe_float(candidate.get("ema9")),
+            "ema20": safe_float(candidate.get("ema20")),
+            "vwap": safe_float(candidate.get("vwap")),
+            "volume_ratio": safe_float(candidate.get("volume_ratio")),
+            "macd": safe_float(candidate.get("macd")),
+            "macd_signal": safe_float(candidate.get("macd_signal")),
+            "atr14": safe_float(candidate.get("atr14")),
+            "market_regime": candidate.get("market_regime"),
+            "session_phase": candidate.get("session_phase"),
+            "qualification_level": candidate.get("qualification_level"),
+            "strict_qualified": bool(candidate.get("strict_qualified")),
+            "executable": bool(candidate.get("executable")),
+        }
+    return {}
 
 
 def _historical_setup_stats(side):
@@ -940,6 +1053,142 @@ def get_intraday_market_regime():
     return result
 
 
+def evaluate_shadow_variants(result):
+    """
+    Evaluate multiple paper-only strategy variants on the same candidate.
+    These labels NEVER make a live suggestion qualified. They are stored only
+    for later target-first / stop-first comparison.
+    """
+    if not isinstance(result, dict):
+        return {}
+
+    signal = str(result.get("signal") or "").upper()
+    interval = str(result.get("interval") or result.get("timeframe") or "unknown").lower()
+    score = abs(safe_float(result.get("score")) or 0)
+    rr = safe_float(result.get("risk_reward")) or 0
+    volume = safe_float(result.get("volume_ratio")) or 0
+    price = safe_float(result.get("current_price") or result.get("price"))
+    ema9 = safe_float(result.get("ema9"))
+    ema20 = safe_float(result.get("ema20"))
+    rsi = safe_float(result.get("rsi14") or result.get("rsi"))
+    macd = safe_float(result.get("macd"))
+    macd_signal = safe_float(result.get("macd_signal"))
+
+    directional = signal in ("BUY", "SELL")
+    ema_ok = (
+        (signal == "BUY" and ema9 is not None and ema20 is not None and ema9 > ema20)
+        or (signal == "SELL" and ema9 is not None and ema20 is not None and ema9 < ema20)
+    )
+    rsi_broad_ok = (
+        (signal == "BUY" and rsi is not None and 45 <= rsi <= 65)
+        or (signal == "SELL" and rsi is not None and 35 <= rsi <= 55)
+    )
+    macd_ok = (
+        (signal == "BUY" and macd is not None and macd_signal is not None and macd > macd_signal)
+        or (signal == "SELL" and macd is not None and macd_signal is not None and macd < macd_signal)
+    )
+
+    base = {
+        "directional": directional,
+        "rr_1_8": rr >= 1.8,
+        "moderate_volume": 0.80 <= volume <= 1.60,
+        "ema_alignment": ema_ok,
+    }
+
+    variants = {
+        "A_EVIDENCE_GUARD": {
+            "active": directional and interval in ("5m", "15m"),
+            "paper_signal": signal,
+            "checks": dict(base),
+            "reason": "Current evidence-guard baseline.",
+        },
+        "B_5M_EVIDENCE": {
+            "active": directional and interval == "5m",
+            "paper_signal": signal,
+            "checks": {
+                "directional": directional,
+                "5m": interval == "5m",
+                "rr_1_8": rr >= 1.8,
+                "moderate_volume": 0.80 <= volume <= 1.50,
+                "ema_alignment": ema_ok,
+                "broad_rsi": rsi_broad_ok,
+            },
+            "reason": "Tests 5m + EMA + moderate volume using the stronger historical 5m cohort.",
+        },
+        "C_REDUCED_CONFIRMATION": {
+            "active": directional and interval == "5m",
+            "paper_signal": signal,
+            "checks": {
+                "directional": directional,
+                "5m": interval == "5m",
+                "rr_1_8": rr >= 1.8,
+                "score_5": score >= 5,
+                "volume_not_extreme": 0.70 <= volume <= 1.80,
+                "ema_alignment": ema_ok,
+            },
+            "reason": "Tests whether fewer confirmation gates avoid late entries.",
+        },
+        "D_15M_OBSERVATION": {
+            "active": directional and interval == "15m",
+            "paper_signal": signal,
+            "checks": {
+                "directional": directional,
+                "15m": interval == "15m",
+                "rr_1_8": rr >= 1.8,
+                "moderate_volume": 0.75 <= volume <= 1.70,
+                "ema_alignment": ema_ok,
+            },
+            "reason": "Observation-only 15m cohort; existing sample is too small for live use.",
+        },
+        "E_INVERSE_SHADOW": {
+            "active": directional and interval in ("5m", "15m"),
+            "paper_signal": "SELL" if signal == "BUY" else "BUY" if signal == "SELL" else signal,
+            "checks": {
+                "directional": directional,
+                "rr_1_8": rr >= 1.8,
+                "source_signal_available": directional,
+            },
+            "reason": "Opposite-direction shadow only; never promoted to a live suggestion.",
+        },
+    }
+
+    for name, variant in variants.items():
+        checks = variant.get("checks") or {}
+        variant["qualified"] = bool(variant.get("active")) and all(bool(v) for v in checks.values())
+        variant["passed_checks"] = sum(bool(v) for v in checks.values())
+        variant["total_checks"] = len(checks)
+        variant["interval"] = interval
+        variant["source_signal"] = signal
+        variant["score"] = score
+        variant["risk_reward"] = rr
+        variant["volume_ratio"] = volume
+        variant["rsi14"] = rsi
+        variant["ema9"] = ema9
+        variant["ema20"] = ema20
+        variant["macd_confirmation"] = macd_ok
+        variant["price"] = price
+
+    return variants
+
+
+def shadow_watch_summary(result):
+    variants = result.get("shadow_variants") or {}
+    qualified = [
+        name for name, data in variants.items()
+        if isinstance(data, dict) and data.get("qualified") is True
+    ]
+    near = []
+    for name, data in variants.items():
+        if not isinstance(data, dict) or not data.get("active") or data.get("qualified"):
+            continue
+        total = int(data.get("total_checks") or 0)
+        passed = int(data.get("passed_checks") or 0)
+        if total and passed >= total - 1:
+            failed = [k for k, v in (data.get("checks") or {}).items() if not v]
+            near.append({"variant": name, "failed_checks": failed})
+    return {"qualified_variants": qualified, "near_miss_variants": near}
+
+
 def is_qualified_setup(result):
     """
     Two-level intraday qualification.
@@ -976,6 +1225,11 @@ def is_qualified_setup(result):
         LATE_QUALIFIED_MIN_VOLUME_RATIO
         if late_session
         else QUALIFIED_MIN_VOLUME_RATIO
+    )
+    max_volume = (
+        LATE_QUALIFIED_MAX_VOLUME_RATIO
+        if late_session
+        else QUALIFIED_MAX_VOLUME_RATIO
     )
 
     # Controlled fallback thresholds. Late-session fallback remains stricter.
@@ -1071,7 +1325,7 @@ def is_qualified_setup(result):
         "buy_or_sell": signal in ("BUY", "SELL"),
         "score": score >= min_score,
         "risk_reward": rr >= min_rr,
-        "volume": volume >= min_volume,
+        "volume": min_volume <= volume <= max_volume,
         "margin": bool(result.get("margin_band_eligible")),
         "valid_trade_levels": valid_levels,
         "historical_filter": historical_ok,
@@ -1115,6 +1369,7 @@ def is_qualified_setup(result):
         "min_score": min_score,
         "min_risk_reward": min_rr,
         "min_volume_ratio": min_volume,
+        "max_volume_ratio": max_volume,
     }
     result["executable_thresholds"] = {
         "min_score": executable_min_score,
@@ -1123,7 +1378,22 @@ def is_qualified_setup(result):
     }
     result["strict_qualified"] = strict_qualified
     result["executable"] = executable
+    result["setup_quality"] = quality
     result["executable_checks"] = executable_checks
+    result["shadow_variants"] = evaluate_shadow_variants(result) if SHADOW_EXPERIMENT_ENABLED else {}
+    result["shadow_watch"] = shadow_watch_summary(result)
+
+    result["evidence_guard"] = {
+        "strategy_version": SCANNER_STRATEGY_VERSION,
+        "daily_suggestion_cap": MAX_QUALIFIED_SUGGESTIONS_PER_DAY,
+        "volume_band": [min_volume, max_volume],
+        "minimum_risk_reward": min_rr,
+        "historical_min_sample": HISTORICAL_MIN_SAMPLE,
+        "historical_min_success_rate": HISTORICAL_MIN_SUCCESS_RATE,
+        "quota_filling_disabled": True,
+        "inverse_test_enabled": INVERSE_PAPER_TEST_ENABLED,
+        "note": "No trade is preferred to a weak setup; profitability is not guaranteed.",
+    }
 
     return strict_qualified, quality, checks
 
@@ -1494,6 +1764,8 @@ class OrderRequest(BaseModel):
     limit_price: Optional[float] = None
     order_value: Optional[float] = None
     stop_loss: Optional[float] = None
+    strategy_mode: Optional[str] = None
+    execution_context: Optional[dict] = None
 
 
 class IntradayExitTargetRequest(BaseModel):
@@ -3098,6 +3370,7 @@ def generate_intraday_signal(
         "interval": str(interval),
         "timeframe": str(interval),
         "strategy_version": SCANNER_STRATEGY_VERSION,
+        "strategy_mode": get_strategy_mode(),
 
         "signal": signal,
 
@@ -3410,6 +3683,13 @@ def intraday_analysis(
         result["qualified"] = bool(qualified)
         result["setup_quality"] = setup_quality
         result["qualification_checks"] = qualification_checks
+
+        # Keep the selected-stock Intraday Analyzer in the SAME runtime mode
+        # as the scanner/multi-timeframe suggestions. Qualification is always
+        # calculated on the original strategy first; inversion, when active,
+        # is applied only after that qualification step.
+        apply_inverse_paper_test(result)
+        result["active_strategy_mode"] = get_strategy_mode()
 
         latest_patterns = result.get("chart_analysis", {}).get(
             "candlestick_patterns", []
@@ -3861,7 +4141,7 @@ def intraday_scanner(
         key=lambda r: (
             -abs(float(r.get("score") or 0)),
             -float(r.get("risk_reward") or 0),
-            -float(r.get("volume_ratio") or 0),
+            abs(float(r.get("volume_ratio") or 0) - 1.15),
         ),
     )
 
@@ -3915,7 +4195,9 @@ def intraday_scanner(
     # a WAIT/NO TRADE signal and never exceed the daily maximum.
     qualified_today_now = scanner_signal_count_today()
     loss_controls_now = today_intraday_loss_controls()
-    fallback_needed = 0 if loss_controls_now["circuit_breaker"] else max(0, min(2 - qualified_today_now, slots))
+    # Evidence-guard v4 never fills a daily quota with weaker candidates.
+    # Zero qualified trades is an acceptable outcome.
+    fallback_needed = 0
 
     if fallback_needed > 0:
         fallback_candidates = [
@@ -4028,6 +4310,26 @@ def intraday_scanner(
         "interval": interval,
         "strategy_version": SCANNER_STRATEGY_VERSION,
         "inverse_paper_test": inverse_mode_enabled(),
+        "shadow_experiment_enabled": SHADOW_EXPERIMENT_ENABLED,
+        "shadow_variants": list(SHADOW_VARIANTS),
+        "shadow_qualified_count": sum(
+            len((r.get("shadow_watch") or {}).get("qualified_variants") or [])
+            for r in results
+        ),
+        "watch_candidates": [
+            {
+                "symbol": r.get("symbol"),
+                "signal": r.get("signal"),
+                "interval": r.get("interval"),
+                "score": r.get("score"),
+                "risk_reward": r.get("risk_reward"),
+                "volume_ratio": r.get("volume_ratio"),
+                "setup_quality": r.get("setup_quality"),
+                "shadow_watch": r.get("shadow_watch"),
+            }
+            for r in results
+            if (r.get("shadow_watch") or {}).get("near_miss_variants")
+        ][:10],
         "inverse_test_note": (
             "Directional BUY/SELL suggestions are intentionally inverted for this paper-test run. "
             "Original signal and levels are preserved in each record."
@@ -5515,6 +5817,15 @@ def place_intraday_paper_order(order: OrderRequest):
     side = str(order.side).upper()
     quantity = int(order.quantity)
     manual_order_value = safe_float(order.order_value)
+    requested_strategy_mode = str(order.strategy_mode or get_strategy_mode()).upper()
+    if requested_strategy_mode not in ("NORMAL", "INVERSE"):
+        requested_strategy_mode = get_strategy_mode()
+
+    supplied_execution_context = (
+        dict(order.execution_context)
+        if isinstance(order.execution_context, dict)
+        else {}
+    )
 
     if not symbol:
         raise HTTPException(status_code=400, detail="Invalid stock symbol")
@@ -5527,6 +5838,10 @@ def place_intraday_paper_order(order: OrderRequest):
 
     if side not in ["BUY", "SELL"]:
         raise HTTPException(status_code=400, detail="Side must be BUY or SELL")
+
+    scanner_execution_context = supplied_execution_context or latest_scanner_execution_context(
+        symbol, side, requested_strategy_mode
+    )
 
     if quantity <= 0:
         raise HTTPException(
@@ -5610,6 +5925,8 @@ def place_intraday_paper_order(order: OrderRequest):
                 "order_type": "LIMIT",
                 "limit_price": limit_price,
                 "stop_loss": order.stop_loss,
+                "strategy_mode": requested_strategy_mode,
+                "execution_context": scanner_execution_context,
                 "status": "WAITING",
                 "initial_market_price": market_price,
                 "previous_market_price": market_price,
@@ -5692,6 +6009,12 @@ def place_intraday_paper_order(order: OrderRequest):
                 if existing
                 else None
             ),
+            "strategy_mode": requested_strategy_mode,
+            "execution_context": (
+                (existing or {}).get("execution_context")
+                if existing and (existing or {}).get("execution_context")
+                else scanner_execution_context
+            ),
             "stop_loss": (
                 safe_float(order.stop_loss)
                 if safe_float(order.stop_loss) is not None
@@ -5741,6 +6064,8 @@ def place_intraday_paper_order(order: OrderRequest):
                     else None
                 ),
                 "stop_loss": safe_float(existing.get("stop_loss")),
+                "strategy_mode": str(existing.get("strategy_mode") or requested_strategy_mode).upper(),
+                "execution_context": dict((existing or {}).get("execution_context") or {}),
             }
             order_action = f"PARTIAL_CLOSE_{closing_direction}"
 
@@ -5766,6 +6091,8 @@ def place_intraday_paper_order(order: OrderRequest):
                             else None
                         ),
                         "stop_loss": safe_float(existing.get("stop_loss")),
+                        "strategy_mode": str((existing or {}).get("strategy_mode") or requested_strategy_mode).upper(),
+                        "execution_context": dict((existing or {}).get("execution_context") or {}),
                     }
 
                     raise HTTPException(
@@ -5790,6 +6117,8 @@ def place_intraday_paper_order(order: OrderRequest):
                     "margin_used": new_margin_required,
                     "exit_target": None,
                     "stop_loss": safe_float(order.stop_loss),
+                    "strategy_mode": requested_strategy_mode,
+                    "execution_context": scanner_execution_context,
                 }
 
                 order_action = (
@@ -5801,6 +6130,21 @@ def place_intraday_paper_order(order: OrderRequest):
                 order_action = f"CLOSE_{closing_direction}"
 
     trade_value = price * quantity
+
+    # Preserve the strategy mode that actually belongs to this execution.
+    # Closing trades inherit the mode of the position being closed, so toggling
+    # NORMAL/INVERSE later does not rewrite the historical category.
+    if current_qty != 0 and ((current_qty > 0 and delta < 0) or (current_qty < 0 and delta > 0)):
+        execution_strategy_mode = str((existing or {}).get("strategy_mode") or requested_strategy_mode).upper()
+    else:
+        execution_strategy_mode = requested_strategy_mode
+    if execution_strategy_mode not in ("NORMAL", "INVERSE"):
+        execution_strategy_mode = "LEGACY"
+
+    if current_qty != 0 and ((current_qty > 0 and delta < 0) or (current_qty < 0 and delta > 0)):
+        trade_context = dict((existing or {}).get("execution_context") or {})
+    else:
+        trade_context = dict(scanner_execution_context or {})
 
     trade = {
         "id": uuid.uuid4().hex,
@@ -5822,6 +6166,34 @@ def place_intraday_paper_order(order: OrderRequest):
         "requested_order_value": manual_order_value,
         "executed_order_value": round(price * quantity, 2),
         "stop_loss": order.stop_loss,
+        "strategy_mode": execution_strategy_mode,
+        "candidate_id": trade_context.get("candidate_id"),
+        "strategy_version": trade_context.get("strategy_version"),
+        "interval": trade_context.get("interval") or "UNKNOWN",
+        "timeframe": trade_context.get("interval") or "UNKNOWN",
+        "original_side": trade_context.get("original_side") or side,
+        "executed_side": trade_context.get("executed_side") or side,
+        "entry_time": trade_context.get("entry_time"),
+        "suggested_entry_price": trade_context.get("suggested_entry_price"),
+        "suggested_stop_loss": trade_context.get("suggested_stop_loss"),
+        "target_1": trade_context.get("target_1"),
+        "target_2": trade_context.get("target_2"),
+        "risk_reward": trade_context.get("risk_reward"),
+        "setup_quality": trade_context.get("setup_quality"),
+        "score": trade_context.get("score"),
+        "rsi14": trade_context.get("rsi14"),
+        "ema9": trade_context.get("ema9"),
+        "ema20": trade_context.get("ema20"),
+        "vwap": trade_context.get("vwap"),
+        "volume_ratio": trade_context.get("volume_ratio"),
+        "macd": trade_context.get("macd"),
+        "macd_signal": trade_context.get("macd_signal"),
+        "atr14": trade_context.get("atr14"),
+        "market_regime": trade_context.get("market_regime"),
+        "session_phase": trade_context.get("session_phase"),
+        "qualification_level": trade_context.get("qualification_level"),
+        "strict_qualified": trade_context.get("strict_qualified"),
+        "executable": trade_context.get("executable"),
     }
 
     # DURABILITY RULE:
@@ -5978,6 +6350,8 @@ def check_intraday_pending_orders():
                         limit_price=None,
                         order_value=None,
                         stop_loss=pending.get("stop_loss"),
+                        strategy_mode=pending.get("strategy_mode"),
+                        execution_context=pending.get("execution_context"),
                     )
                 )
 
@@ -6332,6 +6706,8 @@ def check_intraday_exit_targets():
                     limit_price=None,
                     order_value=None,
                     stop_loss=None,
+                    strategy_mode=position.get("strategy_mode"),
+                    execution_context=position.get("execution_context"),
                 )
             )
         except Exception:

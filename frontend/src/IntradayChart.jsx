@@ -114,6 +114,7 @@ export default function IntradayChart({
 
   const [showEma9, setShowEma9] = useState(true);
   const [showEma20, setShowEma20] = useState(true);
+  const [showVwap, setShowVwap] = useState(true);
   const [hoveredCandle, setHoveredCandle] = useState(null);
   const [selectedCandle, setSelectedCandle] = useState(null);
   const [visibleBars, setVisibleBars] = useState(80);
@@ -341,8 +342,8 @@ export default function IntradayChart({
     if (showEma9) addLine("ema9", ORANGE, 2);
     if (showEma20) addLine("ema20", BLUE, 2);
 
-    // VWAP remains visible as the intraday reference line.
-    addLine("vwap", PURPLE, 2, 2);
+    // VWAP can be shown or hidden independently from EMA 9 and EMA 20.
+    if (showVwap) addLine("vwap", PURPLE, 2, 2);
 
     const addLevel = (price, title, color) => {
       if (!Number.isFinite(price) || !candleSeries?.createPriceLine) return;
@@ -639,6 +640,7 @@ export default function IntradayChart({
     selected,
     showEma9,
     showEma20,
+    showVwap,
     visibleBars,
     scrollStart,
     showPatternMarkers,
@@ -796,7 +798,15 @@ export default function IntradayChart({
             Patterns {showPatternMarkers ? "ON" : "OFF"}
           </button>
 
-        <span style={{ color: PURPLE, marginLeft: 4 }}>--- VWAP</span>
+        <button
+          type="button"
+          onClick={() => setShowVwap((value) => !value)}
+          style={toggleStyle(showVwap, PURPLE)}
+          title="Show or hide VWAP"
+        >
+          <span>{showVwap ? "✓" : "○"}</span>
+          VWAP
+        </button>
         <span>Entry {money(entry)}</span>
         <span style={{ color: RED }}>SL {money(stop)}</span>
         <span style={{ color: GREEN }}>T1 {money(t1)}</span>
@@ -923,9 +933,11 @@ export default function IntradayChart({
           </span>
         )}
 
-        <span style={{ color: PURPLE }}>
-          VWAP <b>{money(displayCandle?.vwap)}</b>
-        </span>
+        {showVwap && (
+          <span style={{ color: PURPLE }}>
+            VWAP <b>{money(displayCandle?.vwap)}</b>
+          </span>
+        )}
       </div>
 
       <div

@@ -420,6 +420,7 @@ export default function App() {
   const [scannerMarketStatus, setScannerMarketStatus] = useState("—");
   const [scannerSessionPhase, setScannerSessionPhase] = useState("—");
   const [scannerPhaseMessage, setScannerPhaseMessage] = useState("");
+  const [todaySuggestionSummary, setTodaySuggestionSummary] = useState(null);
   const [scannerFilter, setScannerFilter] = useState("ALL");
   const [multiTimeframeData, setMultiTimeframeData] = useState([]);
   const [multiTimeframeLoading, setMultiTimeframeLoading] = useState(false);
@@ -721,6 +722,7 @@ export default function App() {
       setScannerMarketStatus(data?.market_status || "—");
       setScannerSessionPhase(data?.session_phase || "—");
       setScannerPhaseMessage(data?.phase_message || "");
+      setTodaySuggestionSummary(data?.today_summary || null);
       setScannerError("");
     } catch (err) {
       console.error("Scanner loading error:", err);
@@ -1417,6 +1419,7 @@ export default function App() {
               dayTradeStopLoss === ""
                 ? null
                 : Number(dayTradeStopLoss),
+            strategy_mode: strategyMode,
           }),
         }
       );
@@ -2686,6 +2689,85 @@ export default function App() {
             border: "2px solid #bfdbfe",
           }}
         >
+          {/* TODAY'S SUGGESTION SUMMARY */}
+          <div
+            style={{
+              padding: 16,
+              marginBottom: 14,
+              borderRadius: 12,
+              border: `2px solid ${
+                todaySuggestionSummary?.no_further_suggestion_today
+                  ? "#94a3b8"
+                  : todaySuggestionSummary?.realized_pnl > 0
+                    ? "#86efac"
+                    : todaySuggestionSummary?.realized_pnl < 0
+                      ? "#fca5a5"
+                      : "#fde68a"
+              }`,
+              background:
+                todaySuggestionSummary?.no_further_suggestion_today
+                  ? "#f8fafc"
+                  : todaySuggestionSummary?.realized_pnl > 0
+                    ? "#f0fdf4"
+                    : todaySuggestionSummary?.realized_pnl < 0
+                      ? "#fef2f2"
+                      : "#fffbeb",
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 900, color: "#0f172a" }}>
+              TODAY'S SUGGESTION SUMMARY
+            </div>
+
+            {todaySuggestionSummary ? (
+              <>
+                <div style={{ marginTop: 8, fontSize: 14, fontWeight: 800 }}>
+                  Latest: {todaySuggestionSummary.status === "CORRECT"
+                    ? "✅ CORRECT"
+                    : todaySuggestionSummary.status === "WRONG"
+                      ? "❌ WRONG"
+                      : todaySuggestionSummary.status === "BREAKEVEN"
+                        ? "➖ BREAKEVEN"
+                        : "🟡 WAITING FOR COMPLETED TRADE"}
+                </div>
+                <div style={{ marginTop: 6, fontSize: 13, color: "#334155", fontWeight: 700 }}>
+                  Trades: {todaySuggestionSummary.completed_trades ?? 0}
+                  {" • "}Wins: {todaySuggestionSummary.wins ?? 0}
+                  {" • "}Losses: {todaySuggestionSummary.losses ?? 0}
+                  {" • "}P&L: {formatMoney(todaySuggestionSummary.realized_pnl ?? 0)}
+                </div>
+                <div style={{ marginTop: 7, fontSize: 13, color: "#475569", lineHeight: 1.5 }}>
+                  {todaySuggestionSummary.headline}
+                </div>
+                <div style={{ marginTop: 5, fontSize: 13, fontWeight: 800, color: todaySuggestionSummary.no_further_suggestion_today ? "#475569" : "#2563eb", lineHeight: 1.5 }}>
+                  {todaySuggestionSummary.no_further_suggestion_today ? "⛔ " : "🔎 "}
+                  {todaySuggestionSummary.next_action}
+                </div>
+                <div style={{ marginTop: 6, fontSize: 12, color: "#64748b" }}>
+                  Qualified suggestions used: {todaySuggestionSummary.qualified_suggestions_used ?? 0}
+                  {" • "}Remaining today: {todaySuggestionSummary.qualified_suggestions_remaining ?? 0}
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ marginTop: 8, fontSize: 14, fontWeight: 800 }}>
+                  {scannerSessionPhase === "END_OF_DAY" || scannerMarketStatus === "CLOSED"
+                    ? "📊 END OF DAY"
+                    : "🟡 SCANNING — WAIT FOR SETUP"}
+                </div>
+                <div style={{ marginTop: 7, fontSize: 13, color: "#475569", lineHeight: 1.5 }}>
+                  {scannerSessionPhase === "END_OF_DAY" || scannerMarketStatus === "CLOSED"
+                    ? "Market session is finished. No further intraday suggestion today."
+                    : "No completed suggestion summary is available yet. The scanner will show a trade only when a setup qualifies."}
+                </div>
+                <div style={{ marginTop: 6, fontSize: 12, color: "#64748b" }}>
+                  {scannerUpdatedAt
+                    ? `Scanner last updated: ${scannerUpdatedAt}`
+                    : "Waiting for scanner update..."}
+                </div>
+              </>
+            )}
+          </div>
+
           <div
             style={{
               display: "flex",
@@ -3792,6 +3874,7 @@ export default function App() {
                         "15m Status",
                         "Alignment",
                         "Final",
+                        "Setup Quality",
                         "Suggested Action",
                         "Action",
                       ].map((heading) => (
@@ -3859,6 +3942,35 @@ export default function App() {
                           >
                             {row.combined_reason || ""}
                           </div>
+                        </td>
+                        <td
+                          style={{
+                            padding: 10,
+                            borderBottom: "1px solid #e2e8f0",
+                            fontWeight: 900,
+                            whiteSpace: "nowrap",
+                          }}
+                          title={`5m: ${
+                            row.analysis_5m?.setup_quality != null
+                              ? Number(row.analysis_5m.setup_quality).toFixed(1)
+                              : "—"
+                          }/10 • 15m: ${
+                            row.analysis_15m?.setup_quality != null
+                              ? Number(row.analysis_15m.setup_quality).toFixed(1)
+                              : "—"
+                          }/10`}
+                        >
+                          {row.analysis_5m?.setup_quality != null &&
+                          row.analysis_15m?.setup_quality != null
+                            ? `${Math.min(
+                                Number(row.analysis_5m.setup_quality),
+                                Number(row.analysis_15m.setup_quality)
+                              ).toFixed(1)} / 10`
+                            : row.analysis_5m?.setup_quality != null
+                              ? `${Number(row.analysis_5m.setup_quality).toFixed(1)} / 10`
+                              : row.analysis_15m?.setup_quality != null
+                                ? `${Number(row.analysis_15m.setup_quality).toFixed(1)} / 10`
+                                : "—"}
                         </td>
                         <td
                           style={{
@@ -7359,7 +7471,7 @@ export default function App() {
                 style={{
                   width: "100%",
                   borderCollapse: "collapse",
-                  minWidth: 1120,
+                  minWidth: 1220,
                 }}
               >
                 <thead>
@@ -7367,6 +7479,7 @@ export default function App() {
                     <th style={thStyle}>Time</th>
                     <th style={thStyle}>Symbol</th>
                     <th style={thStyle}>Side</th>
+                    <th style={thStyle}>Category</th>
                     <th style={thStyle}>Qty</th>
                     <th style={thStyle}>Price</th>
                     <th style={thStyle}>Stop Loss</th>
@@ -7394,6 +7507,40 @@ export default function App() {
                         }}
                       >
                         {trade.side || "—"}
+                      </td>
+
+                      <td style={tdStyle}>
+                        <span
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            padding: "5px 10px",
+                            borderRadius: 999,
+                            fontSize: 12,
+                            fontWeight: 900,
+                            background:
+                              String(trade.strategy_mode || "").toUpperCase() === "INVERSE"
+                                ? "#fffbeb"
+                                : String(trade.strategy_mode || "").toUpperCase() === "NORMAL"
+                                  ? "#f0fdf4"
+                                  : "#f1f5f9",
+                            color:
+                              String(trade.strategy_mode || "").toUpperCase() === "INVERSE"
+                                ? "#92400e"
+                                : String(trade.strategy_mode || "").toUpperCase() === "NORMAL"
+                                  ? "#166534"
+                                  : "#64748b",
+                            border:
+                              String(trade.strategy_mode || "").toUpperCase() === "INVERSE"
+                                ? "1px solid #f59e0b"
+                                : String(trade.strategy_mode || "").toUpperCase() === "NORMAL"
+                                  ? "1px solid #16a34a"
+                                  : "1px solid #cbd5e1",
+                          }}
+                        >
+                          {String(trade.strategy_mode || "LEGACY").toUpperCase()}
+                        </span>
                       </td>
 
                       <td style={tdStyle}>

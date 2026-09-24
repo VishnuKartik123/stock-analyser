@@ -920,7 +920,7 @@ export default function App() {
       // Keep every visible history/account panel in step with the refreshed
       // archive/runtime data instead of requiring a second manual refresh.
       await Promise.allSettled([
-        loadIntradayPaperData?.(),
+        loadDayTradeData(),
         loadPaperData?.(),
         loadScanner?.(true),
         loadMultiTimeframeScanner?.(true),
@@ -1769,8 +1769,15 @@ export default function App() {
   }
 
   async function resetDayTradeAccount() {
+    if (dayTradePositions.length > 0) {
+      setDayTradeMessage(
+        "Reset blocked: square off all open intraday positions first."
+      );
+      return;
+    }
+
     const confirmed = window.confirm(
-      "Reset the intraday paper account, positions and trade history?"
+      "Reset the intraday paper account and pending orders? Executed trade history will be preserved."
     );
 
     if (!confirmed) return;

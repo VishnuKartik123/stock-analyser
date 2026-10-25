@@ -18,6 +18,35 @@ const IS_LOCAL_BACKEND = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(
 // on first load and persisted in this browser. Historical records are not deleted.
 const SHADOW_CLOSED_PNL_BASELINE_KEY = "stockAnalyser.shadowClosedPnlBaseline.v1";
 
+// US regular-session clock estimate (NYSE/Nasdaq): weekdays, 09:30–16:00
+// America/New_York. Exchange holidays are not included in this client-side estimate.
+function getUsRegularSessionStatus(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(now);
+  const value = (type) => parts.find((part) => part.type === type)?.value;
+  const weekday = value("weekday");
+  const hour = Number(value("hour"));
+  const minute = Number(value("minute"));
+  const minutes = hour * 60 + minute;
+  const isWeekday = ["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday);
+  const isOpen = isWeekday && minutes >= 570 && minutes < 960;
+  return {
+    isOpen,
+    label: isOpen ? "OPEN" : "CLOSED",
+    newYorkTime: new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      weekday: "short", month: "short", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hour12: true,
+    }).format(now),
+    note: "Regular-hours estimate only; exchange holidays and special sessions may differ.",
+  };
+}
+
 const PAPER_STOCK_OPTIONS = [
   ["RELIANCE", "Reliance Industries"],
   ["TCS", "Tata Consultancy Services"],
@@ -484,13 +513,18 @@ export default function App() {
   // Independent US-stock paper-trading workspace; never shares NSE account state.
   const [usPaperSymbol, setUsPaperSymbol] = useState("AAPL");
   const [usPaperSide, setUsPaperSide] = useState("BUY");
+  const [usPaperStyle, setUsPaperStyle] = useState("INTRADAY"); // INTRADAY or SWING
+  const [usMarketClockNow, setUsMarketClockNow] = useState(() => new Date());
   const [usPaperQuantity, setUsPaperQuantity] = useState("1");
   const [usPaperPrice, setUsPaperPrice] = useState("");
   const [usPaperStopLoss, setUsPaperStopLoss] = useState("");
   const [usPaperTarget, setUsPaperTarget] = useState("");
   const [usPaperQuote, setUsPaperQuote] = useState(null);
+  const [usPaperAnalysis, setUsPaperAnalysis] = useState(null);
+  const [usPaperAnalysisBusy, setUsPaperAnalysisBusy] = useState(false);
   const [usPaperAccount, setUsPaperAccount] = useState(null);
   const [usPaperLoading, setUsPaperLoading] = useState(false);
+  const [usPaperAutoFillBusy, setUsPaperAutoFillBusy] = useState(false);
   const [usPaperBusy, setUsPaperBusy] = useState(false);
   const [usPaperMessage, setUsPaperMessage] = useState("");
   const [usPaperError, setUsPaperError] = useState("");
@@ -845,12 +879,12 @@ export default function App() {
       setUsPaperError(err?.message || "Could not load the US paper account.");
     }
   }
-  async function refreshUsPaperPrice(symbol = usPaperSymbol) {
+  async function refreshUsPaperPrice(symbol = usPaperSymbol, style = usPaperStyle) {
     const clean = String(symbol || "").trim().toUpperCase();
     if (!clean) { setUsPaperError("Enter a US ticker symbol first."); return; }
     setUsPaperLoading(true); setUsPaperError("");
     try {
-      const quote = await fetchJson(`${BACKEND}/api/us-paper/quote?symbol=${encodeURIComponent(clean)}`);
+      const quote = await fetchJson(`${BACKEND}/api/us-paper/quote?symbol=${encodeURIComponent(clean)}&style=${encodeURIComponent(style)}`);
       setUsPaperQuote(quote);
       setUsPaperPrice(String(quote.price));
       setUsPaperSymbol(clean);
@@ -861,18 +895,77 @@ export default function App() {
       return null;
     } finally { setUsPaperLoading(false); }
   }
+  async function analyzeUsPaperSetup() {
+    const clean = String(usPaperSymbol || "").trim().toUpperCase();
+    if (!clean) { setUsPaperError("Enter a US ticker symbol first."); return; }
+    setUsPaperAnalysisBusy(true); setUsPaperError(""); setUsPaperAnalysis(null);
+    try {
+      const result = await fetchJson(`${BACKEND}/api/us-paper/analyze?symbol=${encodeURIComponent(clean)}&style=${encodeURIComponent(usPaperStyle)}`);
+      setUsPaperAnalysis(result);
+    } catch (err) { setUsPaperError(err?.message || "Could not analyze this US setup."); }
+    finally { setUsPaperAnalysisBusy(false); }
+  }
   async function autoFillUsPaperDetails() {
     const clean = String(usPaperSymbol || "").trim().toUpperCase();
-    const quote = await refreshUsPaperPrice(clean);
-    if (!quote) return;
-    const held = (usPaperAccount?.positions || []).find(p => String(p.symbol).toUpperCase() === clean);
-    if (usPaperSide === "SELL") {
-      setUsPaperQuantity(String(held?.quantity || 1));
-      setUsPaperStopLoss(""); setUsPaperTarget("");
-    } else {
-      if (!String(usPaperQuantity || "").trim() || Number(usPaperQuantity) <= 0) setUsPaperQuantity("1");
-      if (!usPaperStopLoss) setUsPaperStopLoss((Number(quote.price) * 0.98).toFixed(2));
-      if (!usPaperTarget) setUsPaperTarget((Number(quote.price) * 1.04).toFixed(2));
+    if (!clean) {
+      setUsPaperError("Enter a US ticker symbol first.");
+      return;
+    }
+
+    setUsPaperAutoFillBusy(true);
+    setUsPaperError("");
+    setUsPaperMessage("");
+    try {
+      // Calculate from the quote returned by this request, not from state that
+      // may not have updated yet after React batches state changes.
+      let quote = await refreshUsPaperPrice(clean, usPaperStyle);
+      let price = Number(quote?.price ?? quote?.last_price ?? quote?.current_price);
+      if (!(Number.isFinite(price) && price > 0)) {
+        const cachedPrice = String(usPaperQuote?.symbol || "").toUpperCase() === clean
+          ? Number(usPaperQuote?.price) : NaN;
+        if (Number.isFinite(cachedPrice) && cachedPrice > 0) {
+          price = cachedPrice;
+          quote = usPaperQuote;
+          setUsPaperPrice(price.toFixed(2));
+          setUsPaperMessage(`Using the last fetched ${clean} reference price ($${price.toFixed(2)}); refresh was unavailable. Verify its timestamp.`);
+        } else {
+          throw new Error("No valid price was returned. Check the ticker/backend connection, then click Refresh price.");
+        }
+      }
+
+      const held = (usPaperAccount?.positions || []).find(
+        p => String(p.symbol || "").toUpperCase() === clean
+      );
+      if (usPaperSide === "SELL") {
+        if (!held || Number(held.quantity) <= 0) {
+          setUsPaperQuantity("1");
+          setUsPaperStopLoss("");
+          setUsPaperTarget("");
+          setUsPaperMessage(`Price filled for ${clean}, but there is no open US paper position to sell. Buy the stock first or choose BUY.`);
+          return;
+        }
+        setUsPaperQuantity(String(held.quantity));
+        setUsPaperStopLoss("");
+        setUsPaperTarget("");
+        setUsPaperMessage(`Auto-filled SELL details for ${clean}: ${held.quantity} shares at $${price.toFixed(2)}. Stop/target are not used for a sell-to-close.`);
+        return;
+      }
+
+      const currentQty = Number(usPaperQuantity);
+      const quantity = Number.isInteger(currentQty) && currentQty > 0 ? currentQty : 1;
+      const stopPct = usPaperStyle === "INTRADAY" ? 0.01 : 0.02;
+      const targetPct = usPaperStyle === "INTRADAY" ? 0.02 : 0.04;
+      const stop = Number((price * (1 - stopPct)).toFixed(2));
+      const target = Number((price * (1 + targetPct)).toFixed(2));
+      setUsPaperQuantity(String(quantity));
+      setUsPaperPrice(price.toFixed(2));
+      setUsPaperStopLoss(stop.toFixed(2));
+      setUsPaperTarget(target.toFixed(2));
+      setUsPaperMessage(`Auto-filled ${clean} ${usPaperStyle} paper details: ${quantity} share(s), entry $${price.toFixed(2)}, stop $${stop.toFixed(2)}, target $${target.toFixed(2)}. Review before submitting.`);
+    } catch (err) {
+      setUsPaperError(err?.message || "Could not auto-fill US paper-trading details.");
+    } finally {
+      setUsPaperAutoFillBusy(false);
     }
   }
   async function submitUsPaperOrder() {
@@ -887,16 +980,21 @@ export default function App() {
     if (usPaperSide === "BUY" && stop !== null && stop >= price) { setUsPaperError("For a BUY, stop-loss must be below entry price."); return; }
     if (usPaperSide === "BUY" && target !== null && target <= price) { setUsPaperError("For a BUY, target must be above entry price."); return; }
     const warning = usPaperQuote?.warning || "No live-feed guarantee is available.";
-    const approved = window.confirm(`SIMULATED US PAPER ORDER ONLY\n\n${usPaperSide} ${quantity} ${symbol} at $${price.toFixed(2)}\nEstimated value: $${(quantity*price).toFixed(2)}\nStop-loss: ${usPaperSide === "BUY" && stop !== null ? "$"+stop.toFixed(2) : "—"}\nTarget: ${usPaperSide === "BUY" && target !== null ? "$"+target.toFixed(2) : "—"}\n\n${warning}\n\nSubmit this virtual trade? No broker order will be sent.`);
+    const approved = window.confirm(`SIMULATED US PAPER ORDER ONLY\n\nStyle: ${usPaperStyle}\n${usPaperSide} ${quantity} ${symbol} at $${price.toFixed(2)}\nEstimated value: $${(quantity*price).toFixed(2)}\nStop-loss: ${usPaperSide === "BUY" && stop !== null ? "$"+stop.toFixed(2) : "—"}\nTarget: ${usPaperSide === "BUY" && target !== null ? "$"+target.toFixed(2) : "—"}\n\n${warning}\n\nSubmit this virtual trade? No broker order will be sent.`);
     if (!approved) return;
     setUsPaperBusy(true); setUsPaperError(""); setUsPaperMessage("");
     try {
-      const result = await fetchJson(`${BACKEND}/api/us-paper/order`, {method:"POST", body:JSON.stringify({symbol,side:usPaperSide,quantity,price,stop_loss:usPaperSide === "BUY" ? stop : null,target_price:usPaperSide === "BUY" ? target : null,price_source:usPaperQuote?.source || "manual reference price"})});
+      const result = await fetchJson(`${BACKEND}/api/us-paper/order`, {method:"POST", body:JSON.stringify({symbol,side:usPaperSide,quantity,price,stop_loss:usPaperSide === "BUY" ? stop : null,target_price:usPaperSide === "BUY" ? target : null,strategy_mode:usPaperStyle,price_source:usPaperQuote?.source || "manual reference price"})});
       setUsPaperMessage(result?.message || "US paper trade recorded.");
       await loadUsPaperData();
     } catch (err) { setUsPaperError(err?.message || "US paper order failed."); }
     finally { setUsPaperBusy(false); }
   }
+  useEffect(() => {
+    const timer = window.setInterval(() => setUsMarketClockNow(new Date()), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   useEffect(() => {
     if (appPage === "US_TRADING" && isAuthenticated) {
       loadUsPaperData();
@@ -3823,8 +3921,26 @@ export default function App() {
         {appPage === "US_TRADING" && (
           <div style={{display:"grid",gap:18}}>
             <Card title="US Stocks — Paper Trading Workspace">
+              {(() => {
+                const status = getUsRegularSessionStatus(usMarketClockNow);
+                return <div aria-live="polite" style={{display:"flex",flexWrap:"wrap",gap:12,alignItems:"center",justifyContent:"space-between",padding:"13px 15px",background:status.isOpen?"#f0fdf4":"#fff7ed",border:`2px solid ${status.isOpen?"#16a34a":"#ea580c"}`,borderRadius:10,marginBottom:14}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0}}>
+                    <span aria-hidden="true" style={{width:12,height:12,borderRadius:"50%",background:status.isOpen?"#16a34a":"#ea580c",flexShrink:0}} />
+                    <div><div style={{fontSize:11,fontWeight:900,letterSpacing:.7,color:"#475569"}}>US STOCK MARKET · REGULAR SESSION</div><div style={{fontSize:22,fontWeight:1000,color:status.isOpen?"#166534":"#9a3412",lineHeight:1.25}}>{status.label}</div></div>
+                  </div>
+                  <div style={{textAlign:"right",fontSize:12,color:"#334155",lineHeight:1.5}}><div style={{fontWeight:900}}>New York time: {status.newYorkTime}</div><div>{status.note}</div><div>Regular hours: Mon–Fri, 9:30 AM–4:00 PM ET</div></div>
+                </div>;
+              })()}
               <div style={{padding:12,background:"#eff6ff",border:"1px solid #93c5fd",borderRadius:9,color:"#1e40af",fontSize:13,lineHeight:1.6,marginBottom:14}}>
                 <strong>SIMULATION ONLY.</strong> This is a separate USD virtual account and does not share cash, positions, or trade history with NSE. Quotes use Yahoo Finance reference data; the app does not guarantee exchange-real-time or complete extended-hours coverage. No broker is connected and no live order can be sent.
+              </div>
+              <div style={{border:"1px solid #cbd5e1",borderRadius:10,padding:12,background:"#f8fafc",marginBottom:14}}>
+                <div style={{fontSize:14,fontWeight:900,color:"#0f172a",marginBottom:8}}>Choose US trading style</div>
+                <div role="group" aria-label="US trading style" style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:9}}>
+                  <button type="button" aria-pressed={usPaperStyle==="INTRADAY"} onClick={()=>{setUsPaperStyle("INTRADAY");if(usPaperQuote?.price){setUsPaperStopLoss((Number(usPaperQuote.price)*0.99).toFixed(2));setUsPaperTarget((Number(usPaperQuote.price)*1.02).toFixed(2));}refreshUsPaperPrice(usPaperSymbol,"INTRADAY");}} style={{minHeight:48,padding:"12px 14px",borderRadius:8,border:usPaperStyle==="INTRADAY"?"2px solid #1d4ed8":"1px solid #94a3b8",background:usPaperStyle==="INTRADAY"?"#dbeafe":"#ffffff",color:"#1e3a8a",fontWeight:900,cursor:"pointer",visibility:"visible",opacity:1}}>Intraday · Same-day plan</button>
+                  <button type="button" aria-pressed={usPaperStyle==="SWING"} onClick={()=>{setUsPaperStyle("SWING");if(usPaperQuote?.price){setUsPaperStopLoss((Number(usPaperQuote.price)*0.98).toFixed(2));setUsPaperTarget((Number(usPaperQuote.price)*1.04).toFixed(2));}refreshUsPaperPrice(usPaperSymbol,"SWING");}} style={{minHeight:48,padding:"12px 14px",borderRadius:8,border:usPaperStyle==="SWING"?"2px solid #15803d":"1px solid #94a3b8",background:usPaperStyle==="SWING"?"#dcfce7":"#ffffff",color:"#166534",fontWeight:900,cursor:"pointer",visibility:"visible",opacity:1}}>Swing · Multi-day plan</button>
+                </div>
+                <div style={{fontSize:12,color:"#475569",lineHeight:1.55,marginTop:8}}>{usPaperStyle==="INTRADAY"?"Intraday paper plan: auto-fill suggests a 1% stop and 2% target. The app records the trade but does not force-close it at the end of the session.":"Swing paper plan: auto-fill suggests a 2% stop and 4% target. Positions can remain open overnight; monitor and close them manually in this simulator."}</div>
               </div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(145px,1fr))",gap:10,marginBottom:14}}>
                 {[["Virtual cash",usPaperAccount?.cash],["Realized P&L",usPaperAccount?.realized_pnl],["Open positions",(usPaperAccount?.positions||[]).length],["Account currency","USD"]].map(([label,value])=>(
@@ -3832,18 +3948,32 @@ export default function App() {
                 ))}
               </div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(190px,1fr))",gap:12,alignItems:"end"}}>
-                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>US ticker<input value={usPaperSymbol} onChange={e=>setUsPaperSymbol(e.target.value.toUpperCase())} placeholder="AAPL" style={{padding:11,border:"1px solid #94a3b8",borderRadius:7,minWidth:0}} /></label>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>US ticker<input value={usPaperSymbol} onChange={e=>{setUsPaperSymbol(e.target.value.toUpperCase());setUsPaperAnalysis(null);}} placeholder="AAPL" style={{padding:11,border:"1px solid #94a3b8",borderRadius:7,minWidth:0}} /></label>
                 <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Action<select value={usPaperSide} onChange={e=>{setUsPaperSide(e.target.value);if(e.target.value==="SELL"){const held=(usPaperAccount?.positions||[]).find(p=>p.symbol===usPaperSymbol.toUpperCase());if(held)setUsPaperQuantity(String(held.quantity));}}} style={{padding:11,border:"1px solid #94a3b8",borderRadius:7}}><option value="BUY">Buy / add long</option><option value="SELL">Sell / reduce long</option></select></label>
                 <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Quantity (shares)<input type="number" min="1" step="1" value={usPaperQuantity} onChange={e=>setUsPaperQuantity(e.target.value)} style={{padding:11,border:"1px solid #94a3b8",borderRadius:7}} /></label>
                 <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>{usPaperSide==="BUY"?"Entry price (USD)":"Sell price (USD)"}<input type="number" min="0.01" step="0.01" value={usPaperPrice} onChange={e=>setUsPaperPrice(e.target.value)} placeholder={usPaperLoading?"Loading…":"Enter price"} style={{padding:11,border:"1px solid #94a3b8",borderRadius:7}} /></label>
                 <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Stop-loss (USD)<input type="number" min="0.01" step="0.01" value={usPaperStopLoss} onChange={e=>setUsPaperStopLoss(e.target.value)} disabled={usPaperSide==="SELL"} placeholder="Optional" style={{padding:11,border:"1px solid #94a3b8",borderRadius:7,background:usPaperSide==="SELL"?"#f1f5f9":"#fff"}} /></label>
                 <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Target (USD)<input type="number" min="0.01" step="0.01" value={usPaperTarget} onChange={e=>setUsPaperTarget(e.target.value)} disabled={usPaperSide==="SELL"} placeholder="Optional" style={{padding:11,border:"1px solid #94a3b8",borderRadius:7,background:usPaperSide==="SELL"?"#f1f5f9":"#fff"}} /></label>
               </div>
-              <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:13}}>
-                <button type="button" onClick={()=>refreshUsPaperPrice()} disabled={usPaperLoading} style={{padding:"11px 15px",borderRadius:8,border:"1px solid #1d4ed8",background:"#eff6ff",color:"#1d4ed8",fontWeight:900,cursor:"pointer"}}>{usPaperLoading?"Refreshing…":"↻ Refresh price"}</button>
-                <button type="button" onClick={autoFillUsPaperDetails} disabled={usPaperLoading} style={{padding:"11px 15px",borderRadius:8,border:"1px solid #15803d",background:"#f0fdf4",color:"#166534",fontWeight:900,cursor:"pointer"}}>Auto-fill details</button>
-                <button type="button" onClick={submitUsPaperOrder} disabled={usPaperBusy} style={{padding:"11px 18px",borderRadius:8,border:"1px solid #0f172a",background:"#0f172a",color:"#fff",fontWeight:900,cursor:"pointer"}}>{usPaperBusy?"Submitting…":`Confirm Paper ${usPaperSide}`}</button>
+              <div role="group" aria-label="US paper trading actions" style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(190px,1fr))",gap:9,marginTop:13,alignItems:"stretch"}}>
+                <button type="button" onClick={()=>refreshUsPaperPrice()} disabled={usPaperLoading||usPaperAutoFillBusy} style={{minHeight:46,padding:"11px 15px",borderRadius:8,border:"1px solid #1d4ed8",background:"#eff6ff",color:"#1d4ed8",fontWeight:900,cursor:"pointer",visibility:"visible",opacity:1}}>{usPaperLoading?"Refreshing…":"↻ Refresh price"}</button>
+                <button type="button" onClick={autoFillUsPaperDetails} disabled={usPaperAutoFillBusy||usPaperLoading} style={{minHeight:46,padding:"11px 15px",borderRadius:8,border:"1px solid #15803d",background:"#f0fdf4",color:"#166534",fontWeight:900,cursor:usPaperAutoFillBusy||usPaperLoading?"wait":"pointer",visibility:"visible",opacity:1}}>{usPaperAutoFillBusy?"Filling details…":"Auto-fill details"}</button>
+                <button type="button" onClick={analyzeUsPaperSetup} disabled={usPaperAnalysisBusy} style={{minHeight:46,padding:"11px 15px",borderRadius:8,border:"1px solid #7c3aed",background:"#f5f3ff",color:"#5b21b6",fontWeight:900,cursor:"pointer",visibility:"visible",opacity:1}}>{usPaperAnalysisBusy?"Analyzing…":`Analyze ${usPaperStyle.toLowerCase()} setup`}</button>
+                <button type="button" onClick={submitUsPaperOrder} disabled={usPaperBusy} style={{minHeight:46,padding:"11px 18px",borderRadius:8,border:"1px solid #0f172a",background:"#0f172a",color:"#fff",fontWeight:900,cursor:"pointer",visibility:"visible",opacity:1}}>{usPaperBusy?"Submitting…":`Confirm Paper ${usPaperSide}`}</button>
               </div>
+              {usPaperAnalysis && (
+                <div style={{marginTop:12,padding:13,background:"#faf5ff",border:"1px solid #d8b4fe",borderRadius:9,color:"#3b0764",fontSize:13,lineHeight:1.6}}>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",justifyContent:"space-between"}}>
+                    <strong>{usPaperAnalysis.symbol} · {usPaperAnalysis.style} setup</strong>
+                    <span style={{padding:"4px 8px",borderRadius:999,background:usPaperAnalysis.signal==="BULLISH_SETUP"?"#dcfce7":usPaperAnalysis.signal==="BEARISH_OR_WEAK"?"#fee2e2":"#fef3c7",color:usPaperAnalysis.signal==="BULLISH_SETUP"?"#166534":usPaperAnalysis.signal==="BEARISH_OR_WEAK"?"#991b1b":"#92400e",fontWeight:900}}>{usPaperAnalysis.signal}</span>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:8,marginTop:10}}>
+                    {[ ["Latest bar",usPaperAnalysis.timestamp||"—"], ["Price", "$"+Number(usPaperAnalysis.last_price).toFixed(2)], ["EMA20", "$"+Number(usPaperAnalysis.ema20).toFixed(2)], ["RSI(14)",usPaperAnalysis.rsi14==null?"—":Number(usPaperAnalysis.rsi14).toFixed(1)], ["Timeframe",usPaperAnalysis.interval||"—"] ].map(([label,value])=><div key={label} style={{padding:8,border:"1px solid #e9d5ff",borderRadius:7,background:"#fff",minWidth:0}}><div style={{fontSize:11,fontWeight:800,color:"#6b21a8"}}>{label}</div><div style={{fontWeight:900,overflowWrap:"anywhere"}}>{value}</div></div>)}
+                  </div>
+                  <p style={{margin:"10px 0 4px"}}>{usPaperAnalysis.rationale}</p>
+                  <div style={{fontSize:11,color:"#6b21a8"}}>{usPaperAnalysis.warning}</div>
+                </div>
+              )}
               {usPaperQuote && (
                 <div style={{marginTop:12,padding:11,background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:8,fontSize:12,lineHeight:1.6,color:"#475569"}}>
                   <strong>{usPaperQuote.symbol} reference:</strong> USD <span>{Number(usPaperQuote.price).toFixed(2)}</span>
@@ -3856,13 +3986,13 @@ export default function App() {
               )}
               {usPaperMessage && <div role="status" style={{marginTop:10,padding:10,borderRadius:8,background:"#f0fdf4",border:"1px solid #bbf7d0",color:"#166534",fontSize:13}}>{usPaperMessage}</div>}
               {usPaperError && <div role="alert" style={{marginTop:10,padding:10,borderRadius:8,background:"#fef2f2",border:"1px solid #fecaca",color:"#991b1b",fontSize:13}}>{usPaperError}</div>}
-              <div style={{marginTop:14}}><div style={{fontSize:12,fontWeight:900,color:"#475569",marginBottom:8}}>QUICK SYMBOLS</div><div style={{display:"flex",gap:7,flexWrap:"wrap"}}>{["AAPL","MSFT","NVDA","AMZN","META","TSLA","GOOGL","AMD","SPY","QQQ"].map(ticker=><button key={ticker} type="button" onClick={()=>{setUsPaperSymbol(ticker);setUsPaperError("");refreshUsPaperPrice(ticker);}} style={{padding:"7px 11px",borderRadius:999,border:usPaperSymbol===ticker?"2px solid #0f172a":"1px solid #cbd5e1",background:usPaperSymbol===ticker?"#e2e8f0":"#fff",fontWeight:800,cursor:"pointer"}}>{ticker}</button>)}</div></div>
+              <div style={{marginTop:14,padding:12,border:"1px solid #e2e8f0",borderRadius:9,background:"#ffffff"}}><div style={{fontSize:12,fontWeight:900,color:"#475569",marginBottom:8}}>QUICK SYMBOLS · CLICK TO LOAD A QUOTE</div><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(76px,1fr))",gap:7}}>{["AAPL","MSFT","NVDA","AMZN","META","TSLA","GOOGL","AMD","SPY","QQQ"].map(ticker=><button key={ticker} type="button" onClick={()=>{setUsPaperSymbol(ticker);setUsPaperError("");refreshUsPaperPrice(ticker);}} style={{minHeight:40,padding:"8px 10px",borderRadius:8,border:usPaperSymbol===ticker?"2px solid #0f172a":"1px solid #cbd5e1",background:usPaperSymbol===ticker?"#e2e8f0":"#fff",color:"#0f172a",fontWeight:900,cursor:"pointer",visibility:"visible",opacity:1}}>{ticker}</button>)}</div></div>
             </Card>
-            <Card title="US Paper Positions">
-              {(usPaperAccount?.positions||[]).length===0 ? <p style={{color:"#64748b",margin:0}}>No US paper positions yet. Use the order panel above to create a simulated position.</p> : <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr>{["Symbol","Qty","Avg. cost","Stop-loss","Target","Action"].map(x=><th key={x} style={thStyle}>{x}</th>)}</tr></thead><tbody>{usPaperAccount.positions.map(pos=><tr key={pos.symbol}><td style={tdStyle}><strong>{pos.symbol}</strong></td><td style={tdStyle}>{pos.quantity}</td><td style={tdStyle}>${Number(pos.average_price).toFixed(2)}</td><td style={tdStyle}>{pos.stop_loss==null?"—":"$"+Number(pos.stop_loss).toFixed(2)}</td><td style={tdStyle}>{pos.target_price==null?"—":"$"+Number(pos.target_price).toFixed(2)}</td><td style={tdStyle}><button type="button" onClick={()=>{setUsPaperSymbol(pos.symbol);setUsPaperSide("SELL");setUsPaperQuantity(String(pos.quantity));refreshUsPaperPrice(pos.symbol);}} style={{padding:"6px 10px",borderRadius:6,border:"1px solid #b91c1c",background:"#fef2f2",color:"#991b1b",fontWeight:800,cursor:"pointer"}}>Prepare Sell</button></td></tr>)}</tbody></table></div>}
+            <Card title={`US Paper Positions · ${usPaperStyle} workspace`}>
+              {(usPaperAccount?.positions||[]).length===0 ? <p style={{color:"#64748b",margin:0}}>No US paper positions yet. Use the order panel above to create a simulated position.</p> : <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr>{["Symbol","Style","Qty","Avg. cost","Stop-loss","Target","Action"].map(x=><th key={x} style={thStyle}>{x}</th>)}</tr></thead><tbody>{usPaperAccount.positions.map(pos=><tr key={pos.symbol}><td style={tdStyle}><strong>{pos.symbol}</strong></td><td style={tdStyle}>{pos.strategy_mode||"SWING"}</td><td style={tdStyle}>{pos.quantity}</td><td style={tdStyle}>${Number(pos.average_price).toFixed(2)}</td><td style={tdStyle}>{pos.stop_loss==null?"—":"$"+Number(pos.stop_loss).toFixed(2)}</td><td style={tdStyle}>{pos.target_price==null?"—":"$"+Number(pos.target_price).toFixed(2)}</td><td style={tdStyle}><button type="button" onClick={()=>{setUsPaperSymbol(pos.symbol);setUsPaperSide("SELL");setUsPaperQuantity(String(pos.quantity));refreshUsPaperPrice(pos.symbol);}} style={{padding:"6px 10px",borderRadius:6,border:"1px solid #b91c1c",background:"#fef2f2",color:"#991b1b",fontWeight:800,cursor:"pointer"}}>Prepare Sell</button></td></tr>)}</tbody></table></div>}
             </Card>
             <Card title={`US Paper Trade History (${(usPaperAccount?.trades||[]).length})`}>
-              {(usPaperAccount?.trades||[]).length===0 ? <p style={{color:"#64748b",margin:0}}>No US paper trades recorded yet.</p> : <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr>{["Time","Symbol","Side","Qty","Fill price","Value","Realized P&L"].map(x=><th key={x} style={thStyle}>{x}</th>)}</tr></thead><tbody>{usPaperAccount.trades.map(trade=><tr key={trade.id}><td style={tdStyle}>{trade.timestamp ? new Date(trade.timestamp).toLocaleString() : "—"}</td><td style={tdStyle}><strong>{trade.symbol}</strong></td><td style={tdStyle}>{trade.side}</td><td style={tdStyle}>{trade.quantity}</td><td style={tdStyle}>${Number(trade.price).toFixed(2)}</td><td style={tdStyle}>${Number(trade.value).toFixed(2)}</td><td style={tdStyle}>{trade.realized_pnl==null?"—":"$"+Number(trade.realized_pnl).toFixed(2)}</td></tr>)}</tbody></table></div>}
+              {(usPaperAccount?.trades||[]).length===0 ? <p style={{color:"#64748b",margin:0}}>No US paper trades recorded yet.</p> : <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr>{["Time","Symbol","Style","Side","Qty","Fill price","Value","Realized P&L"].map(x=><th key={x} style={thStyle}>{x}</th>)}</tr></thead><tbody>{usPaperAccount.trades.map(trade=><tr key={trade.id}><td style={tdStyle}>{trade.timestamp ? new Date(trade.timestamp).toLocaleString() : "—"}</td><td style={tdStyle}><strong>{trade.symbol}</strong></td><td style={tdStyle}>{trade.strategy_mode||"SWING"}</td><td style={tdStyle}>{trade.side}</td><td style={tdStyle}>{trade.quantity}</td><td style={tdStyle}>${Number(trade.price).toFixed(2)}</td><td style={tdStyle}>${Number(trade.value).toFixed(2)}</td><td style={tdStyle}>{trade.realized_pnl==null?"—":"$"+Number(trade.realized_pnl).toFixed(2)}</td></tr>)}</tbody></table></div>}
             </Card>
           </div>
         )}

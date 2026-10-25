@@ -481,6 +481,19 @@ export default function App() {
   // INTRADAY = intraday Buy / Sell analysis
   const [analysisCategory, setAnalysisCategory] = useState("NORMAL");
   const [appPage, setAppPage] = useState("LIVE");
+  // Independent US-stock paper-trading workspace; never shares NSE account state.
+  const [usPaperSymbol, setUsPaperSymbol] = useState("AAPL");
+  const [usPaperSide, setUsPaperSide] = useState("BUY");
+  const [usPaperQuantity, setUsPaperQuantity] = useState("1");
+  const [usPaperPrice, setUsPaperPrice] = useState("");
+  const [usPaperStopLoss, setUsPaperStopLoss] = useState("");
+  const [usPaperTarget, setUsPaperTarget] = useState("");
+  const [usPaperQuote, setUsPaperQuote] = useState(null);
+  const [usPaperAccount, setUsPaperAccount] = useState(null);
+  const [usPaperLoading, setUsPaperLoading] = useState(false);
+  const [usPaperBusy, setUsPaperBusy] = useState(false);
+  const [usPaperMessage, setUsPaperMessage] = useState("");
+  const [usPaperError, setUsPaperError] = useState("");
   const [intelligence, setIntelligence] = useState(null);
   const [intelligenceLoading, setIntelligenceLoading] = useState(false);
   const [strategyComparison, setStrategyComparison] = useState(null);
@@ -510,7 +523,7 @@ export default function App() {
   const [profitabilityAuditError, setProfitabilityAuditError] = useState("");
   const [profitabilityAuditLoading, setProfitabilityAuditLoading] = useState(false);
   // Swing scanner: daily-bar research only; it never places orders.
-  const [swingScanSymbols, setSwingScanSymbols] = useState("RELIANCE,TCS,INFY,HDFCBANK,ICICIBANK,SBIN,LT,BHARTIARTL,ITC,AXISBANK,KOTAKBANK,BAJFINANCE,MARUTI,SUNPHARMA,TITAN,ULTRACEMCO,NTPC,POWERGRID,ONGC,ASIANPAINT,ADANIPORTS,JSWSTEEL,COALINDIA,HCLTECH,WIPRO,TRENT,DRREDDY,INDUSINDBK,M&M");
+  const [swingScanSymbols, setSwingScanSymbols] = useState("RELIANCE,TCS,INFY,HDFCBANK,ICICIBANK,SBIN,LT,BHARTIARTL,ITC,AXISBANK,KOTAKBANK,BAJFINANCE,MARUTI,SUNPHARMA,TITAN,ULTRACEMCO,NTPC,POWERGRID,ONGC,ASIANPAINT,ADANIPORTS,JSWSTEEL,COALINDIA,HCLTECH,WIPRO,TRENT,DRREDDY,INDUSINDBK,M&M,BAJAJFINSV,BAJAJ-AUTO,ETERNAL,TECHM,GRASIM,NESTLEIND,SHRIRAMFIN,TATAMOTORS,TATASTEEL,APOLLOHOSP,CIPLA,SBILIFE,HDFCLIFE,HEROMOTOCO,EICHERMOT,PIDILITIND,BRITANNIA,DLF,ADANIENT,HAL,BEL");
   const [swingRiskBudget, setSwingRiskBudget] = useState("250");
   const [swingAllocation, setSwingAllocation] = useState("20000");
   const [swingScanResult, setSwingScanResult] = useState(null);
@@ -524,10 +537,40 @@ export default function App() {
   const [swingDetailQuote, setSwingDetailQuote] = useState(null);
   const [swingDetailLoading, setSwingDetailLoading] = useState(false);
   const [swingDetailError, setSwingDetailError] = useState("");
+  // Swing page paper-trading controls. These only call the local paper simulator.
+  const [swingPaperSymbol, setSwingPaperSymbol] = useState("RELIANCE");
+  const [swingPaperSide, setSwingPaperSide] = useState("BUY");
+  const [swingPaperQuantity, setSwingPaperQuantity] = useState("1");
+  // Auto-filled from the latest available quote; editable for price-based paper fills.
+  const [swingPaperPrice, setSwingPaperPrice] = useState("");
+  const [swingPaperPriceLoading, setSwingPaperPriceLoading] = useState(false);
+  const [swingPaperStopLoss, setSwingPaperStopLoss] = useState("");
+  const [swingPaperTarget, setSwingPaperTarget] = useState("");
+  const [swingPaperBusy, setSwingPaperBusy] = useState(false);
+  const [swingPaperMessage, setSwingPaperMessage] = useState("");
+  const [swingRiskEdits, setSwingRiskEdits] = useState({});
   const [swingSetupFilter, setSwingSetupFilter] = useState("ALL");
   const [swingNewMatches, setSwingNewMatches] = useState([]);
   const [swingNotificationsEnabled, setSwingNotificationsEnabled] = useState(false);
   const swingNotifiedSymbolsRef = useRef(new Set());
+
+  // Auto-fill the simulated entry/sell price whenever the selected stock changes.
+  // This uses the backend's latest available reference quote; users can still edit it.
+  useEffect(() => {
+    const clean = String(swingPaperSymbol || "").trim().toUpperCase();
+    if (!clean) { setSwingPaperPrice(""); return; }
+    let cancelled = false;
+    setSwingPaperPriceLoading(true);
+    fetchJson(`${BACKEND}/api/stock/fast-price?symbol=${encodeURIComponent(clean)}`)
+      .then(data => {
+        if (!cancelled && Number(data?.price || data?.ltp) > 0) {
+          setSwingPaperPrice(String(data.price || data.ltp));
+        }
+      })
+      .catch(() => { /* Keep the field editable if quote data is unavailable. */ })
+      .finally(() => { if (!cancelled) setSwingPaperPriceLoading(false); });
+    return () => { cancelled = true; };
+  }, [swingPaperSymbol]);
 
   async function enableSwingNotifications() {
     if (!("Notification" in window)) {
@@ -576,7 +619,7 @@ export default function App() {
     const clean = String(swingDetailSymbol || "").trim().toUpperCase();
     if (!clean) return;
     const existing = swingScanSymbols.split(",").map(x => x.trim().toUpperCase()).filter(Boolean);
-    const next = Array.from(new Set([clean, ...existing])).slice(0, 30);
+    const next = Array.from(new Set([clean, ...existing])).slice(0, 100);
     setSwingScanSymbols(next.join(","));
     setSwingScanError("");
   }
@@ -608,6 +651,118 @@ export default function App() {
     } catch (err) {
       setSwingScanError(err?.message || "Swing scan failed. Check backend and historical-data availability.");
     } finally { setSwingScanBusy(false); }
+  }
+
+  async function placeSwingPaperOrder() {
+    const symbol = String(swingPaperSymbol || "").trim().toUpperCase();
+    const qty = Number(swingPaperQuantity);
+    if (!symbol) { setSwingPaperMessage("Enter an NSE stock symbol."); return; }
+    if (!Number.isInteger(qty) || qty <= 0) { setSwingPaperMessage("Quantity must be a positive whole number."); return; }
+    const executionPrice = Number(swingPaperPrice);
+    if (!Number.isFinite(executionPrice) || executionPrice <= 0) { setSwingPaperMessage("Enter a valid simulated entry/sell price. Use Refresh price if needed."); return; }
+    const stop = swingPaperStopLoss === "" ? null : Number(swingPaperStopLoss);
+    const target = swingPaperTarget === "" ? null : Number(swingPaperTarget);
+    if (swingPaperSide === "BUY" && stop !== null && (!Number.isFinite(stop) || stop <= 0)) { setSwingPaperMessage("Enter a valid stop-loss price."); return; }
+    if (swingPaperSide === "BUY" && target !== null && (!Number.isFinite(target) || target <= 0)) { setSwingPaperMessage("Enter a valid target price."); return; }
+    if (swingPaperSide === "BUY" && stop !== null && target !== null && stop >= target) { setSwingPaperMessage("For a long trade, stop-loss must be below target."); return; }
+    setSwingPaperBusy(true); setSwingPaperMessage("");
+    try {
+      const data = await fetchJson(`${BACKEND}/api/paper/order`, { method: "POST", body: JSON.stringify({ symbol, side: swingPaperSide, quantity: qty, order_type: "LIMIT", limit_price: executionPrice, stop_loss: swingPaperSide === "BUY" ? stop : null, target_price: swingPaperSide === "BUY" ? target : null }) });
+      setSwingPaperMessage(data?.message || `Paper ${swingPaperSide} simulated at ₹${executionPrice.toFixed(2)} for ${qty} share(s) of ${symbol}.`);
+      await loadPaperData();
+      if (swingPaperSide === "BUY") { setSwingPaperStopLoss(""); setSwingPaperTarget(""); }
+    } catch (err) {
+      setSwingPaperMessage(`Paper order failed: ${err?.message || "Unable to execute simulated order."}`);
+    } finally { setSwingPaperBusy(false); }
+  }
+
+  // One-click execution for a visible Swing Scanner candidate. This submits to the
+  // local paper simulator only; it never sends a broker/live-money order.
+  async function executeSwingCandidatePaper(row) {
+    const symbol = String(row?.symbol || "").trim().toUpperCase();
+    if (!symbol || row?.status === "DATA_ERROR") {
+      setSwingPaperMessage(`Cannot execute ${symbol || "this row"}: the scanner has no usable price data. Try refreshing the scan.`);
+      return;
+    }
+    // Make the busy state visible during quote refresh as well as order submission.
+    setSwingPaperBusy(true);
+    setSwingPaperMessage(`Preparing ${symbol} for simulated paper execution…`);
+    try {
+      let price = Number(row?.entry_reference || row?.close);
+      try {
+        const quote = await fetchJson(`${BACKEND}/api/stock/fast-price?symbol=${encodeURIComponent(symbol)}&refresh=true`);
+        const latest = Number(quote?.price || quote?.ltp);
+        if (Number.isFinite(latest) && latest > 0) price = latest;
+      } catch { /* Use the scanner's last reference close if the refresh is unavailable. */ }
+      if (!Number.isFinite(price) || price <= 0) {
+        throw new Error(`No valid price found for ${symbol}. Refresh the scan or enter a price in the paper-trading ticket.`);
+      }
+      const cash = Number(paperAccount?.cash ?? 100000);
+      const suggestedQty = Number(row?.quantity_at_risk_budget);
+      const qty = Number.isInteger(suggestedQty) && suggestedQty > 0
+        ? suggestedQty
+        : Math.floor(Math.min(20000, cash) / price);
+      if (!Number.isInteger(qty) || qty <= 0) {
+        throw new Error(`Insufficient virtual cash to buy one share of ${symbol} at ₹${price.toFixed(2)}.`);
+      }
+      const stop = Number(row?.stop_reference);
+      const target = Number(row?.target_2r_reference);
+      const stopLoss = Number.isFinite(stop) && stop > 0 && stop < price ? stop : Number((price * 0.98).toFixed(2));
+      const targetPrice = Number.isFinite(target) && target > price ? target : Number((price * 1.04).toFixed(2));
+      const statusWarning = String(row?.status || "").startsWith("REVIEW_CANDIDATE")
+        ? ""
+        : `\nScanner status is ${row?.status || "not qualified"}; this is a manual paper-only override, not a scanner recommendation.\n`;
+      const confirmed = window.confirm(
+        `Send ${symbol} to PAPER EXECUTION?${statusWarning}\nBUY ${qty} share(s)\nReference fill: ₹${price.toFixed(2)}\nStop-loss: ₹${stopLoss.toFixed(2)}\nTarget (2R reference): ₹${targetPrice.toFixed(2)}\nOrder value: ₹${(qty * price).toFixed(2)}\n\nThis only updates your virtual paper account. No broker/live order will be sent.`
+      );
+      if (!confirmed) {
+        setSwingPaperMessage(`Paper execution cancelled for ${symbol}.`);
+        return;
+      }
+      setSwingPaperSymbol(symbol); setSwingPaperSide("BUY"); setSwingPaperQuantity(String(qty));
+      setSwingPaperPrice(String(price)); setSwingPaperStopLoss(String(stopLoss)); setSwingPaperTarget(String(targetPrice));
+      const data = await fetchJson(`${BACKEND}/api/paper/order`, {
+        method: "POST",
+        body: JSON.stringify({ symbol, side: "BUY", quantity: qty, order_type: "LIMIT", limit_price: price, stop_loss: stopLoss, target_price: targetPrice, manual_override: true, execution_context: { source: "swing_scanner", scanner_status: row?.status || null, score: row?.score ?? null } })
+      });
+      setSwingPaperMessage(data?.message || `Paper BUY simulated for ${qty} share(s) of ${symbol} at ₹${price.toFixed(2)}.`);
+      await loadPaperData();
+    } catch (err) {
+      setSwingPaperMessage(`Paper order failed for ${symbol}: ${err?.message || "Unable to execute simulated order."}`);
+    } finally { setSwingPaperBusy(false); }
+  }
+
+  async function closeSwingPaperPosition(position) {
+    if (!position?.symbol || !Number.isInteger(Number(position.quantity)) || Number(position.quantity) <= 0) return;
+    const confirmed = window.confirm(`Paper-sell all ${position.quantity} share(s) of ${position.symbol} at the latest available reference price? No live order will be sent.`);
+    if (!confirmed) return;
+    setSwingPaperBusy(true); setSwingPaperMessage("");
+    try {
+      const data = await fetchJson(`${BACKEND}/api/paper/order`, { method: "POST", body: JSON.stringify({ symbol: position.symbol, side: "SELL", quantity: Number(position.quantity), order_type: "MARKET" }) });
+      setSwingPaperMessage(data?.message || `Paper position in ${position.symbol} closed.`);
+      await loadPaperData();
+    } catch (err) {
+      setSwingPaperMessage(`Paper exit failed: ${err?.message || "Unable to close simulated position."}`);
+    } finally { setSwingPaperBusy(false); }
+  }
+
+  async function saveSwingPaperRisk(position) {
+    const edit = swingRiskEdits[position.symbol] || {};
+    const stopRaw = edit.stop_loss !== undefined ? edit.stop_loss : (position.stop_loss ?? "");
+    const targetRaw = edit.target_price !== undefined ? edit.target_price : (position.target_price ?? "");
+    const stop = stopRaw === "" || stopRaw == null ? null : Number(stopRaw);
+    const target = targetRaw === "" || targetRaw == null ? null : Number(targetRaw);
+    if (stop !== null && (!Number.isFinite(stop) || stop <= 0)) { setSwingPaperMessage("Stop-loss must be a positive price."); return; }
+    if (target !== null && (!Number.isFinite(target) || target <= 0)) { setSwingPaperMessage("Target must be a positive price."); return; }
+    if (stop !== null && stop >= Number(position.average_price)) { setSwingPaperMessage("For a long position, stop-loss must be below average buy price."); return; }
+    if (target !== null && target <= Number(position.average_price)) { setSwingPaperMessage("For a long position, target must be above average buy price."); return; }
+    try {
+      const data = await fetchJson(`${BACKEND}/api/paper/position/${encodeURIComponent(position.symbol)}/risk`, { method: "POST", body: JSON.stringify({ stop_loss: stop, target_price: target }) });
+      setSwingPaperMessage(data?.message || `Risk levels saved for ${position.symbol}.`);
+      await loadPaperData();
+    } catch (err) {
+      setSwingPaperMessage(`Could not save risk levels: ${err?.message || "Request failed."}`);
+    }
   }
 
   function exportSwingScanCsv() {
@@ -682,6 +837,73 @@ export default function App() {
     } catch (err) { setStrategyLabOosError(err?.message || "Out-of-sample test failed"); }
     finally { setStrategyLabOosBusy(false); }
   }
+  async function loadUsPaperData() {
+    try {
+      const data = await fetchJson(`${BACKEND}/api/us-paper/account`);
+      setUsPaperAccount(data);
+    } catch (err) {
+      setUsPaperError(err?.message || "Could not load the US paper account.");
+    }
+  }
+  async function refreshUsPaperPrice(symbol = usPaperSymbol) {
+    const clean = String(symbol || "").trim().toUpperCase();
+    if (!clean) { setUsPaperError("Enter a US ticker symbol first."); return; }
+    setUsPaperLoading(true); setUsPaperError("");
+    try {
+      const quote = await fetchJson(`${BACKEND}/api/us-paper/quote?symbol=${encodeURIComponent(clean)}`);
+      setUsPaperQuote(quote);
+      setUsPaperPrice(String(quote.price));
+      setUsPaperSymbol(clean);
+      setUsPaperMessage(`Loaded ${clean} reference price: $${Number(quote.price).toFixed(2)}. Check the timestamp before using it.`);
+      return quote;
+    } catch (err) {
+      setUsPaperError(err?.message || `Could not load a quote for ${clean}.`);
+      return null;
+    } finally { setUsPaperLoading(false); }
+  }
+  async function autoFillUsPaperDetails() {
+    const clean = String(usPaperSymbol || "").trim().toUpperCase();
+    const quote = await refreshUsPaperPrice(clean);
+    if (!quote) return;
+    const held = (usPaperAccount?.positions || []).find(p => String(p.symbol).toUpperCase() === clean);
+    if (usPaperSide === "SELL") {
+      setUsPaperQuantity(String(held?.quantity || 1));
+      setUsPaperStopLoss(""); setUsPaperTarget("");
+    } else {
+      if (!String(usPaperQuantity || "").trim() || Number(usPaperQuantity) <= 0) setUsPaperQuantity("1");
+      if (!usPaperStopLoss) setUsPaperStopLoss((Number(quote.price) * 0.98).toFixed(2));
+      if (!usPaperTarget) setUsPaperTarget((Number(quote.price) * 1.04).toFixed(2));
+    }
+  }
+  async function submitUsPaperOrder() {
+    const symbol = String(usPaperSymbol || "").trim().toUpperCase();
+    const quantity = Number(usPaperQuantity);
+    const price = Number(usPaperPrice);
+    const stop = usPaperStopLoss === "" ? null : Number(usPaperStopLoss);
+    const target = usPaperTarget === "" ? null : Number(usPaperTarget);
+    if (!symbol) { setUsPaperError("Enter a US ticker symbol."); return; }
+    if (!Number.isInteger(quantity) || quantity <= 0) { setUsPaperError("Quantity must be a positive whole number."); return; }
+    if (!Number.isFinite(price) || price <= 0) { setUsPaperError("Refresh the price or enter a valid simulated fill price."); return; }
+    if (usPaperSide === "BUY" && stop !== null && stop >= price) { setUsPaperError("For a BUY, stop-loss must be below entry price."); return; }
+    if (usPaperSide === "BUY" && target !== null && target <= price) { setUsPaperError("For a BUY, target must be above entry price."); return; }
+    const warning = usPaperQuote?.warning || "No live-feed guarantee is available.";
+    const approved = window.confirm(`SIMULATED US PAPER ORDER ONLY\n\n${usPaperSide} ${quantity} ${symbol} at $${price.toFixed(2)}\nEstimated value: $${(quantity*price).toFixed(2)}\nStop-loss: ${usPaperSide === "BUY" && stop !== null ? "$"+stop.toFixed(2) : "—"}\nTarget: ${usPaperSide === "BUY" && target !== null ? "$"+target.toFixed(2) : "—"}\n\n${warning}\n\nSubmit this virtual trade? No broker order will be sent.`);
+    if (!approved) return;
+    setUsPaperBusy(true); setUsPaperError(""); setUsPaperMessage("");
+    try {
+      const result = await fetchJson(`${BACKEND}/api/us-paper/order`, {method:"POST", body:JSON.stringify({symbol,side:usPaperSide,quantity,price,stop_loss:usPaperSide === "BUY" ? stop : null,target_price:usPaperSide === "BUY" ? target : null,price_source:usPaperQuote?.source || "manual reference price"})});
+      setUsPaperMessage(result?.message || "US paper trade recorded.");
+      await loadUsPaperData();
+    } catch (err) { setUsPaperError(err?.message || "US paper order failed."); }
+    finally { setUsPaperBusy(false); }
+  }
+  useEffect(() => {
+    if (appPage === "US_TRADING" && isAuthenticated) {
+      loadUsPaperData();
+      refreshUsPaperPrice(usPaperSymbol);
+    }
+  }, [appPage, isAuthenticated]);
+
   useEffect(() => {
     if (appPage === "STRATEGIES" && isAuthenticated) {
       if (strategyLabCatalog.length === 0) loadStrategyLabCatalog();
@@ -1241,6 +1463,15 @@ export default function App() {
 
   const [paperAccount, setPaperAccount] = useState(null);
   const [positions, setPositions] = useState([]);
+
+  // When selling a held position, default quantity to the currently open quantity.
+  // Keep this effect below the positions state declaration to avoid a temporal-dead-zone error.
+  useEffect(() => {
+    if (swingPaperSide !== "SELL") return;
+    const clean = String(swingPaperSymbol || "").trim().toUpperCase();
+    const held = positions.find(p => String(p.symbol || "").toUpperCase() === clean);
+    if (held && Number(held.quantity) > 0) setSwingPaperQuantity(String(held.quantity));
+  }, [swingPaperSide, swingPaperSymbol, positions]);
   const [trades, setTrades] = useState([]);
 
   const [paperSymbol, setPaperSymbol] = useState("RELIANCE");
@@ -3579,8 +3810,62 @@ export default function App() {
                 color:appPage==="STRATEGIES"?"#ffffff":"#334155"}}>
               PAGE 4 • STRATEGY LAB
             </button>
+            <button type="button" onClick={() => setAppPage("US_TRADING")}
+              style={{padding:"13px 16px",borderRadius:10,cursor:"pointer",fontWeight:900,
+                border:appPage==="US_TRADING"?"2px solid #0f172a":"1px solid #cbd5e1",
+                background:appPage==="US_TRADING"?"#0f172a":"#ffffff",
+                color:appPage==="US_TRADING"?"#ffffff":"#334155"}}>
+              PAGE 5 • US PAPER TRADING
+            </button>
           </div>
         </Card>
+
+        {appPage === "US_TRADING" && (
+          <div style={{display:"grid",gap:18}}>
+            <Card title="US Stocks — Paper Trading Workspace">
+              <div style={{padding:12,background:"#eff6ff",border:"1px solid #93c5fd",borderRadius:9,color:"#1e40af",fontSize:13,lineHeight:1.6,marginBottom:14}}>
+                <strong>SIMULATION ONLY.</strong> This is a separate USD virtual account and does not share cash, positions, or trade history with NSE. Quotes use Yahoo Finance reference data; the app does not guarantee exchange-real-time or complete extended-hours coverage. No broker is connected and no live order can be sent.
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(145px,1fr))",gap:10,marginBottom:14}}>
+                {[["Virtual cash",usPaperAccount?.cash],["Realized P&L",usPaperAccount?.realized_pnl],["Open positions",(usPaperAccount?.positions||[]).length],["Account currency","USD"]].map(([label,value])=>(
+                  <div key={label} style={{border:"1px solid #e2e8f0",borderRadius:9,padding:12,background:"#fff"}}><div style={{fontSize:12,color:"#64748b",fontWeight:800}}>{label}</div><div style={{fontSize:20,fontWeight:900,color:"#0f172a",marginTop:5}}>{typeof value === "number" ? "$"+value.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2}) : (value ?? "—")}</div></div>
+                ))}
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(190px,1fr))",gap:12,alignItems:"end"}}>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>US ticker<input value={usPaperSymbol} onChange={e=>setUsPaperSymbol(e.target.value.toUpperCase())} placeholder="AAPL" style={{padding:11,border:"1px solid #94a3b8",borderRadius:7,minWidth:0}} /></label>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Action<select value={usPaperSide} onChange={e=>{setUsPaperSide(e.target.value);if(e.target.value==="SELL"){const held=(usPaperAccount?.positions||[]).find(p=>p.symbol===usPaperSymbol.toUpperCase());if(held)setUsPaperQuantity(String(held.quantity));}}} style={{padding:11,border:"1px solid #94a3b8",borderRadius:7}}><option value="BUY">Buy / add long</option><option value="SELL">Sell / reduce long</option></select></label>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Quantity (shares)<input type="number" min="1" step="1" value={usPaperQuantity} onChange={e=>setUsPaperQuantity(e.target.value)} style={{padding:11,border:"1px solid #94a3b8",borderRadius:7}} /></label>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>{usPaperSide==="BUY"?"Entry price (USD)":"Sell price (USD)"}<input type="number" min="0.01" step="0.01" value={usPaperPrice} onChange={e=>setUsPaperPrice(e.target.value)} placeholder={usPaperLoading?"Loading…":"Enter price"} style={{padding:11,border:"1px solid #94a3b8",borderRadius:7}} /></label>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Stop-loss (USD)<input type="number" min="0.01" step="0.01" value={usPaperStopLoss} onChange={e=>setUsPaperStopLoss(e.target.value)} disabled={usPaperSide==="SELL"} placeholder="Optional" style={{padding:11,border:"1px solid #94a3b8",borderRadius:7,background:usPaperSide==="SELL"?"#f1f5f9":"#fff"}} /></label>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Target (USD)<input type="number" min="0.01" step="0.01" value={usPaperTarget} onChange={e=>setUsPaperTarget(e.target.value)} disabled={usPaperSide==="SELL"} placeholder="Optional" style={{padding:11,border:"1px solid #94a3b8",borderRadius:7,background:usPaperSide==="SELL"?"#f1f5f9":"#fff"}} /></label>
+              </div>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:13}}>
+                <button type="button" onClick={()=>refreshUsPaperPrice()} disabled={usPaperLoading} style={{padding:"11px 15px",borderRadius:8,border:"1px solid #1d4ed8",background:"#eff6ff",color:"#1d4ed8",fontWeight:900,cursor:"pointer"}}>{usPaperLoading?"Refreshing…":"↻ Refresh price"}</button>
+                <button type="button" onClick={autoFillUsPaperDetails} disabled={usPaperLoading} style={{padding:"11px 15px",borderRadius:8,border:"1px solid #15803d",background:"#f0fdf4",color:"#166534",fontWeight:900,cursor:"pointer"}}>Auto-fill details</button>
+                <button type="button" onClick={submitUsPaperOrder} disabled={usPaperBusy} style={{padding:"11px 18px",borderRadius:8,border:"1px solid #0f172a",background:"#0f172a",color:"#fff",fontWeight:900,cursor:"pointer"}}>{usPaperBusy?"Submitting…":`Confirm Paper ${usPaperSide}`}</button>
+              </div>
+              {usPaperQuote && (
+                <div style={{marginTop:12,padding:11,background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:8,fontSize:12,lineHeight:1.6,color:"#475569"}}>
+                  <strong>{usPaperQuote.symbol} reference:</strong> USD <span>{Number(usPaperQuote.price).toFixed(2)}</span>
+                  {" · Latest bar: "}<span>{usPaperQuote.timestamp || "unknown"}</span>
+                  {" · Interval: "}<span>{usPaperQuote.interval || "unknown"}</span>
+                  {" · Source: "}<span>{usPaperQuote.source || "unknown"}</span>
+                  <br />
+                  <span>{usPaperQuote.warning}</span>
+                </div>
+              )}
+              {usPaperMessage && <div role="status" style={{marginTop:10,padding:10,borderRadius:8,background:"#f0fdf4",border:"1px solid #bbf7d0",color:"#166534",fontSize:13}}>{usPaperMessage}</div>}
+              {usPaperError && <div role="alert" style={{marginTop:10,padding:10,borderRadius:8,background:"#fef2f2",border:"1px solid #fecaca",color:"#991b1b",fontSize:13}}>{usPaperError}</div>}
+              <div style={{marginTop:14}}><div style={{fontSize:12,fontWeight:900,color:"#475569",marginBottom:8}}>QUICK SYMBOLS</div><div style={{display:"flex",gap:7,flexWrap:"wrap"}}>{["AAPL","MSFT","NVDA","AMZN","META","TSLA","GOOGL","AMD","SPY","QQQ"].map(ticker=><button key={ticker} type="button" onClick={()=>{setUsPaperSymbol(ticker);setUsPaperError("");refreshUsPaperPrice(ticker);}} style={{padding:"7px 11px",borderRadius:999,border:usPaperSymbol===ticker?"2px solid #0f172a":"1px solid #cbd5e1",background:usPaperSymbol===ticker?"#e2e8f0":"#fff",fontWeight:800,cursor:"pointer"}}>{ticker}</button>)}</div></div>
+            </Card>
+            <Card title="US Paper Positions">
+              {(usPaperAccount?.positions||[]).length===0 ? <p style={{color:"#64748b",margin:0}}>No US paper positions yet. Use the order panel above to create a simulated position.</p> : <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr>{["Symbol","Qty","Avg. cost","Stop-loss","Target","Action"].map(x=><th key={x} style={thStyle}>{x}</th>)}</tr></thead><tbody>{usPaperAccount.positions.map(pos=><tr key={pos.symbol}><td style={tdStyle}><strong>{pos.symbol}</strong></td><td style={tdStyle}>{pos.quantity}</td><td style={tdStyle}>${Number(pos.average_price).toFixed(2)}</td><td style={tdStyle}>{pos.stop_loss==null?"—":"$"+Number(pos.stop_loss).toFixed(2)}</td><td style={tdStyle}>{pos.target_price==null?"—":"$"+Number(pos.target_price).toFixed(2)}</td><td style={tdStyle}><button type="button" onClick={()=>{setUsPaperSymbol(pos.symbol);setUsPaperSide("SELL");setUsPaperQuantity(String(pos.quantity));refreshUsPaperPrice(pos.symbol);}} style={{padding:"6px 10px",borderRadius:6,border:"1px solid #b91c1c",background:"#fef2f2",color:"#991b1b",fontWeight:800,cursor:"pointer"}}>Prepare Sell</button></td></tr>)}</tbody></table></div>}
+            </Card>
+            <Card title={`US Paper Trade History (${(usPaperAccount?.trades||[]).length})`}>
+              {(usPaperAccount?.trades||[]).length===0 ? <p style={{color:"#64748b",margin:0}}>No US paper trades recorded yet.</p> : <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr>{["Time","Symbol","Side","Qty","Fill price","Value","Realized P&L"].map(x=><th key={x} style={thStyle}>{x}</th>)}</tr></thead><tbody>{usPaperAccount.trades.map(trade=><tr key={trade.id}><td style={tdStyle}>{trade.timestamp ? new Date(trade.timestamp).toLocaleString() : "—"}</td><td style={tdStyle}><strong>{trade.symbol}</strong></td><td style={tdStyle}>{trade.side}</td><td style={tdStyle}>{trade.quantity}</td><td style={tdStyle}>${Number(trade.price).toFixed(2)}</td><td style={tdStyle}>${Number(trade.value).toFixed(2)}</td><td style={tdStyle}>{trade.realized_pnl==null?"—":"$"+Number(trade.realized_pnl).toFixed(2)}</td></tr>)}</tbody></table></div>}
+            </Card>
+          </div>
+        )}
 
         {appPage === "STRATEGIES" && (
           <div style={{display:"grid",gap:18}}>
@@ -3588,7 +3873,7 @@ export default function App() {
               <summary style={{cursor:"pointer",fontWeight:800,color:"#475569",fontSize:13}}>Optional: inspect a specific stock manually</summary>
               <div style={{marginTop:12}}>
             <Card title="Swing Trading Workspace — Daily Analysis & Chart">
-              <p style={{marginTop:0,color:"#475569",lineHeight:1.6}}>Use this simple workflow to shortlist a stock, check its daily trend, and prepare a risk-managed trade plan. The app provides research calculations only; it does not place orders.</p>
+              <p style={{marginTop:0,color:"#475569",lineHeight:1.6}}>Analyze daily setups and test Buy/Sell decisions with virtual cash. All orders in this section are simulated paper trades; no broker is connected and no live order can be sent.</p>
               <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(190px,1fr))",gap:10,marginBottom:14}}>
                 {[["1. Choose a stock","Enter an NSE symbol such as RELIANCE or TCS."],["2. Check the chart","Click Analyze Swing Stock. Review the latest price, RSI, moving averages and daily chart."],["3. Run the scanner","Use the watchlist scanner below. Start with Review candidates; read each stock’s reasons and warnings."],["4. Plan before buying","Use the reference price, stop, target and quantity as a checklist. Verify the live price and place any order yourself through your broker."]].map(([heading,body],i)=><div key={heading} style={{padding:12,border:"1px solid #cbd5e1",borderRadius:9,background:i===3?"#eff6ff":"#f8fafc",color:"#1f2937"}}><div style={{fontWeight:900,fontSize:13,marginBottom:5,color:"#0f172a"}}>{heading}</div><div style={{fontSize:12,lineHeight:1.55,color:"#334155"}}>{body}</div></div>)}
               </div>
@@ -3655,8 +3940,8 @@ export default function App() {
               </div>
             </details>
             <Card title="Swing Opportunity Scanner — Daily Charts">
-              <p style={{marginTop:0,color:"#475569",lineHeight:1.6}}>One click is enough. The backend checks a preset watchlist of 29 NSE stocks, evaluates trend, RSI, MACD, volume, relative strength, volatility and the NIFTY market filter, then returns the best qualifying watchlist candidate—or clearly says <strong>No trade</strong> when conditions are weak. It never places orders.</p>
-              <div style={{padding:12,marginBottom:12,border:"1px solid #bfdbfe",borderRadius:9,background:"#eff6ff",color:"#1e3a8a",fontSize:13,lineHeight:1.6}}><strong>How to read the result:</strong> <strong>REVIEW_CANDIDATE</strong> means review the setup further, not “buy immediately.” <strong>WAIT / blocked</strong> means do not treat it as a current entry. <strong>DATA_ERROR</strong> means the stock’s data could not be checked. Open a stock’s “reasons and risk flags” row before deciding.</div>
+              <p style={{marginTop:0,color:"#475569",lineHeight:1.6}}>One click is enough. The backend checks a preset watchlist of 29 NSE stocks, evaluates trend, RSI, MACD, volume, relative strength, volatility and the NIFTY market filter, then returns the best qualifying watchlist candidate. A bearish NIFTY filter is treated as a risk warning rather than an absolute veto, but counter-trend candidates must still pass stock-level rules. It never places orders.</p>
+              <div style={{padding:12,marginBottom:12,border:"1px solid #bfdbfe",borderRadius:9,background:"#eff6ff",color:"#1e3a8a",fontSize:13,lineHeight:1.6}}><strong>How to read the result:</strong> <strong>REVIEW_CANDIDATE</strong> means review the setup further, not “buy immediately.” A counter-trend candidate can appear in a bearish market, with an explicit elevated-risk warning. <strong>WAIT</strong> means the stock-level rules did not qualify; <strong>DATA_ERROR</strong> means the data could not be checked. Open a stock’s “reasons and risk flags” row before deciding.</div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:12,marginTop:12}}>
                 <label style={{display:"grid",gap:6,fontSize:13,fontWeight:700}}>Planned risk per candidate (₹)
                   <input type="number" min="10" max="500" value={swingRiskBudget} onChange={e=>setSwingRiskBudget(e.target.value)} style={{padding:10,border:"1px solid #cbd5e1",borderRadius:8}} />
@@ -3720,17 +4005,45 @@ export default function App() {
                   {[ ["ALL","All results"],["CANDIDATES","Review candidates"],["WAIT","Wait / blocked"],["ERROR","Data errors"] ].map(([value,label])=><button key={value} type="button" aria-pressed={swingScanFilter===value} onClick={()=>setSwingScanFilter(value)} style={{display:"inline-flex",alignItems:"center",justifyContent:"center",minHeight:40,padding:"9px 12px",borderRadius:8,border:swingScanFilter===value?"2px solid #1d4ed8":"1px solid #64748b",background:swingScanFilter===value?"#dbeafe":"#ffffff",color:swingScanFilter===value?"#1d4ed8":"#1f2937",fontWeight:800,fontSize:13,lineHeight:1.3,cursor:"pointer",opacity:1,visibility:"visible",whiteSpace:"nowrap",flexShrink:0}}>{label}</button>)}
                 </div>
                 <div style={{overflowX:"auto",border:"1px solid #e2e8f0",borderRadius:8}}>
-                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:1120}}>
-                    <thead><tr>{["Symbol","Score / 100","Status","Setup","Close","RSI","ATR %","Vol ×","RS vs NIFTY","Stop ref.","Target 2R","Qty*","Risk*"].map(label=><th key={label} style={{padding:9,textAlign:"left",background:"#f8fafc",borderBottom:"1px solid #cbd5e1",whiteSpace:"nowrap"}}>{label}</th>)}</tr></thead>
-                    <tbody>{(swingScanResult.results||[]).filter(r=>(swingScanFilter==="ALL"?true:swingScanFilter==="CANDIDATES"?String(r.status||"").startsWith("REVIEW_CANDIDATE"):swingScanFilter==="ERROR"?r.status==="DATA_ERROR":!String(r.status||"").startsWith("REVIEW_CANDIDATE")&&r.status!=="DATA_ERROR")&&(swingSetupFilter==="ALL"||(r.setup_matches||[]).includes(swingSetupFilter))).map((r,i)=><tr key={`${r.symbol}-${i}`}>
-                      {[r.symbol,`${r.score??0}/100`,r.status,r.setup,r.close==null?"—":formatMoney(r.close),r.rsi14??"—",r.atr_pct==null?"—":`${r.atr_pct}%`,r.volume_ratio==null?"—":`${r.volume_ratio}×`,r.relative_strength_vs_nifty_pct_points==null?"—":`${r.relative_strength_vs_nifty_pct_points} pp`,r.stop_reference==null?"—":formatMoney(r.stop_reference),r.target_2r_reference==null?"—":formatMoney(r.target_2r_reference),r.quantity_at_risk_budget??"—",r.planned_price_risk_rupees==null?"—":formatMoney(r.planned_price_risk_rupees)].map((value,j)=><td key={j} style={{padding:9,borderBottom:"1px solid #e2e8f0",whiteSpace:"nowrap",fontWeight:j===0||j===1?800:400,color:j===2&&String(r.status||"").startsWith("REVIEW_CANDIDATE")?"#166534":j===2&&r.status==="MARKET_FILTER_BLOCKED"?"#9a3412":"#0f172a"}}>{value}</td>)}
-                    </tr>)}</tbody>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:900}}>
+                    <thead><tr>{["Symbol","Score / 100","Status","Setup","Price","Stop-loss","Target (2R)","Qty*","Execution"].map(label=><th key={label} style={{padding:9,textAlign:"left",background:"#f8fafc",borderBottom:"1px solid #cbd5e1",whiteSpace:"nowrap"}}>{label}</th>)}</tr></thead>
+                    <tbody>{(swingScanResult.results||[]).filter(r=>(swingScanFilter==="ALL"?true:swingScanFilter==="CANDIDATES"?String(r.status||"").startsWith("REVIEW_CANDIDATE"):swingScanFilter==="ERROR"?r.status==="DATA_ERROR":!String(r.status||"").startsWith("REVIEW_CANDIDATE")&&r.status!=="DATA_ERROR")&&(swingSetupFilter==="ALL"||(r.setup_matches||[]).includes(swingSetupFilter))).map((r,i)=>{const eligible=Boolean(String(r.symbol||"").trim())&&r.status!=="DATA_ERROR"&&(Number(r.entry_reference)>0||Number(r.close)>0);return <tr key={`${r.symbol}-${i}`}>
+                      {[r.symbol,`${r.score??0}/100`,r.status,r.setup,r.close==null?"—":formatMoney(r.close),r.stop_reference==null?"—":formatMoney(r.stop_reference),r.target_2r_reference==null?"—":formatMoney(r.target_2r_reference),r.quantity_at_risk_budget??"—"].map((value,j)=><td key={j} style={{padding:9,borderBottom:"1px solid #e2e8f0",whiteSpace:"nowrap",fontWeight:j===0||j===1?800:400,color:j===2&&String(r.status||"").startsWith("REVIEW_CANDIDATE")?"#166534":j===2&&(r.status==="MARKET_FILTER_BLOCKED"||r.status==="WAIT_MARKET_RISK")?"#9a3412":"#0f172a"}}>{value}</td>)}
+                      <td style={{padding:8,borderBottom:"1px solid #e2e8f0",whiteSpace:"nowrap"}}><button type="button" disabled={!eligible||swingPaperBusy} title={!eligible?"This row has no usable price data":"Refreshes price, calculates a safe fallback quantity if needed, and asks for confirmation before simulated execution"} onClick={()=>executeSwingCandidatePaper(r)} style={{display:"inline-flex",alignItems:"center",justifyContent:"center",minHeight:36,padding:"8px 10px",border:"1px solid #15803d",borderRadius:7,background:eligible&&!swingPaperBusy?"#15803d":"#e2e8f0",color:eligible&&!swingPaperBusy?"#ffffff":"#64748b",fontWeight:900,cursor:eligible&&!swingPaperBusy?"pointer":"not-allowed",whiteSpace:"nowrap"}}>{swingPaperBusy?"Preparing…":"Send to Execution"}</button></td>
+                    </tr>})}</tbody>
                   </table>
                 </div>
-                <p style={{margin:0,fontSize:12,color:"#64748b"}}>*Quantity and planned risk are illustrations using the entered risk/allocation caps; they exclude costs and do not account for other open positions. Score weights: trend 25, momentum 20, setup 20, volume 15, relative strength 15, volatility fit 5.</p>
-                <div style={{display:"grid",gap:8}}>{(swingScanResult.results||[]).filter(r=>(swingScanFilter==="ALL"?true:swingScanFilter==="CANDIDATES"?String(r.status||"").startsWith("REVIEW_CANDIDATE"):swingScanFilter==="ERROR"?r.status==="DATA_ERROR":!String(r.status||"").startsWith("REVIEW_CANDIDATE")&&r.status!=="DATA_ERROR")&&(swingSetupFilter==="ALL"||(r.setup_matches||[]).includes(swingSetupFilter))).map((r,i)=><details key={`details-${r.symbol}-${i}`} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:10}}><summary style={{cursor:"pointer",fontWeight:800,color:"#0f172a"}}>{r.symbol} · {r.status} · {r.score??0}/100 — open simple plan</summary><div style={{display:"grid",gap:10,marginTop:10}}>{String(r.status||"").startsWith("REVIEW_CANDIDATE")&&<div style={{padding:12,border:"1px solid #bfdbfe",borderRadius:8,background:"#eff6ff",color:"#1e3a8a",fontSize:13,lineHeight:1.6}}><strong>Quick plan (research reference only)</strong>{(r.setup_matches||[]).length>0&&<div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:7}}>{r.setup_matches.map((setup,j)=><span key={j} style={{padding:"4px 7px",borderRadius:999,border:"1px solid #93c5fd",background:"#dbeafe",color:"#1e40af",fontSize:11,fontWeight:800}}>{setup}</span>)}</div>}<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8,marginTop:8}}><div><div style={{fontSize:11}}>Reference price</div><strong>{r.close==null?"—":formatMoney(r.close)}</strong></div><div><div style={{fontSize:11}}>Stop reference</div><strong>{r.stop_reference==null?"—":formatMoney(r.stop_reference)}</strong></div><div><div style={{fontSize:11}}>Target at 2R</div><strong>{r.target_2r_reference==null?"—":formatMoney(r.target_2r_reference)}</strong></div><div><div style={{fontSize:11}}>Illustrative quantity</div><strong>{r.quantity_at_risk_budget??"—"}</strong></div></div><div style={{marginTop:7}}>Before entering: confirm the live price, check liquidity and upcoming news/results, verify that the stop distance is acceptable, and calculate total costs. If the setup or data is unclear, skip the trade.</div></div>}<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:10}}><div><strong style={{fontSize:12}}>Why it was flagged</strong>{(r.reasons||[]).length?<ul style={{marginTop:5,paddingLeft:18,color:"#166534",fontSize:12,lineHeight:1.6}}>{r.reasons.map((x,j)=><li key={j}>{x}</li>)}</ul>:<p style={{fontSize:12,color:"#64748b"}}>No qualifying reasons.</p>}</div><div><strong style={{fontSize:12}}>Warnings / things to check</strong>{(r.warnings||[]).length?<ul style={{marginTop:5,paddingLeft:18,color:"#9a3412",fontSize:12,lineHeight:1.6}}>{r.warnings.map((x,j)=><li key={j}>{x}</li>)}</ul>:<p style={{fontSize:12,color:"#64748b"}}>No additional rule-based warnings.</p>}</div></div><p style={{fontSize:11,color:"#64748b",marginBottom:0}}>{r.caveat||"Research only; no order placed."} Data as of {r.as_of||"unknown"}.</p></div></details>)}</div>
+                <p style={{margin:0,fontSize:12,color:"#64748b"}}>*“Send to Execution” is enabled for any row with usable price data, including WAIT / MARKET-RISK rows. Those statuses trigger an explicit warning in the confirmation prompt. Quantity uses the scanner suggestion or a fallback capped at ₹20,000 and available virtual cash. Paper-only; no broker order is sent.</p>
+                <div style={{display:"grid",gap:8}}>{(swingScanResult.results||[]).filter(r=>(swingScanFilter==="ALL"?true:swingScanFilter==="CANDIDATES"?String(r.status||"").startsWith("REVIEW_CANDIDATE"):swingScanFilter==="ERROR"?r.status==="DATA_ERROR":!String(r.status||"").startsWith("REVIEW_CANDIDATE")&&r.status!=="DATA_ERROR")&&(swingSetupFilter==="ALL"||(r.setup_matches||[]).includes(swingSetupFilter))).map((r,i)=><details key={`details-${r.symbol}-${i}`} style={{border:"1px solid #e2e8f0",borderRadius:8,padding:10}}><summary style={{cursor:"pointer",fontWeight:800,color:"#0f172a"}}>{r.symbol} · {r.status} · {r.score??0}/100 — open simple plan</summary><div style={{display:"grid",gap:10,marginTop:10}}>{String(r.status||"").startsWith("REVIEW_CANDIDATE")&&<div style={{padding:12,border:"1px solid #bfdbfe",borderRadius:8,background:"#eff6ff",color:"#1e3a8a",fontSize:13,lineHeight:1.6}}><strong>Quick plan (research reference only)</strong>{(r.setup_matches||[]).length>0&&<div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:7}}>{r.setup_matches.map((setup,j)=><span key={j} style={{padding:"4px 7px",borderRadius:999,border:"1px solid #93c5fd",background:"#dbeafe",color:"#1e40af",fontSize:11,fontWeight:800}}>{setup}</span>)}</div>}<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8,marginTop:8}}><div><div style={{fontSize:11}}>Reference price</div><strong>{r.close==null?"—":formatMoney(r.close)}</strong></div><div><div style={{fontSize:11}}>Stop reference</div><strong>{r.stop_reference==null?"—":formatMoney(r.stop_reference)}</strong></div><div><div style={{fontSize:11}}>Target at 2R</div><strong>{r.target_2r_reference==null?"—":formatMoney(r.target_2r_reference)}</strong></div><div><div style={{fontSize:11}}>Illustrative quantity</div><strong>{r.quantity_at_risk_budget??"—"}</strong></div></div><div style={{marginTop:7}}>Before entering: confirm the live price, check liquidity and upcoming news/results, verify that the stop distance is acceptable, and calculate total costs. If the setup or data is unclear, skip the trade.</div><button type="button" onClick={()=>{setSwingPaperSymbol(r.symbol);setSwingPaperSide("BUY");setSwingPaperQuantity(String(r.quantity_at_risk_budget||1));setSwingPaperPrice(r.entry_reference==null?String(r.close||""):String(r.entry_reference));setSwingPaperStopLoss(r.stop_reference==null?"":String(r.stop_reference));setSwingPaperTarget(r.target_2r_reference==null?"":String(r.target_2r_reference));setSwingPaperMessage(`Loaded ${r.symbol} reference plan into the paper-trading ticket. Confirm the price and levels before submitting.`);}} style={{marginTop:9,padding:"8px 11px",border:"1px solid #2563eb",borderRadius:7,background:"#ffffff",color:"#1d4ed8",fontWeight:800,cursor:"pointer"}}>Use this plan in Paper Trading</button><button type="button" disabled={swingPaperBusy} onClick={()=>executeSwingCandidatePaper(r)} style={{marginTop:9,marginLeft:8,padding:"9px 12px",border:"1px solid #15803d",borderRadius:7,background:swingPaperBusy?"#d1d5db":"#15803d",color:"#ffffff",fontWeight:900,cursor:swingPaperBusy?"not-allowed":"pointer"}}>{swingPaperBusy?"Submitting…":"Execute Paper Trade"}</button></div>}<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:10}}><div><strong style={{fontSize:12}}>Why it was flagged</strong>{(r.reasons||[]).length?<ul style={{marginTop:5,paddingLeft:18,color:"#166534",fontSize:12,lineHeight:1.6}}>{r.reasons.map((x,j)=><li key={j}>{x}</li>)}</ul>:<p style={{fontSize:12,color:"#64748b"}}>No qualifying reasons.</p>}</div><div><strong style={{fontSize:12}}>Warnings / things to check</strong>{(r.warnings||[]).length?<ul style={{marginTop:5,paddingLeft:18,color:"#9a3412",fontSize:12,lineHeight:1.6}}>{r.warnings.map((x,j)=><li key={j}>{x}</li>)}</ul>:<p style={{fontSize:12,color:"#64748b"}}>No additional rule-based warnings.</p>}</div></div><p style={{fontSize:11,color:"#64748b",marginBottom:0}}>{r.caveat||"Research only; no order placed."} Data as of {r.as_of||"unknown"}.</p></div></details>)}</div>
                 <div style={{padding:12,background:"#fff7ed",border:"1px solid #fed7aa",borderRadius:8,color:"#9a3412",fontSize:12,lineHeight:1.65}}><strong>Important limitations:</strong> { (swingScanResult.limitations||[]).join(" ") }</div>
               </div>}
+            </Card>
+            <Card title="Swing Paper Trading — Buy / Sell Simulator">
+              <div style={{padding:11,border:"1px solid #93c5fd",background:"#eff6ff",borderRadius:8,color:"#1e40af",fontSize:12,lineHeight:1.5,marginBottom:12}}><strong>PAPER MODE ONLY.</strong> Uses virtual cash and the latest available daily-price reference. No broker connection or real-money order execution. Stop-loss/target levels are tracked against available prices; this simulator does not guarantee real-time alerts or automatic exits.</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:14}}>
+                {[["Virtual cash",paperAccount?.cash],["Open position value",paperAccount?.position_value],["Realized P&L",paperAccount?.realized_pnl],["Unrealized P&L",paperAccount?.unrealized_pnl],["Total paper P&L",paperAccount?.total_pnl ?? paperAccount?.pnl]].map(([label,value])=><div key={label} style={{padding:12,border:"1px solid #e2e8f0",borderRadius:8,background:"#f8fafc"}}><div style={{fontSize:12,color:"#64748b",marginBottom:5}}>{label}</div><strong style={{fontSize:17,color:label.includes("P&L")&&Number(value)<0?"#b91c1c":label.includes("P&L")&&Number(value)>0?"#15803d":"#0f172a"}}>{value==null?"—":formatMoney(value)}</strong></div>)}
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,alignItems:"end"}}>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>NSE symbol<input value={swingPaperSymbol} onChange={e=>setSwingPaperSymbol(e.target.value.toUpperCase())} placeholder="e.g. RELIANCE" style={{padding:10,border:"1px solid #cbd5e1",borderRadius:7}} /></label>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Action<select value={swingPaperSide} onChange={e=>{const side=e.target.value;setSwingPaperSide(side);if(side==="SELL"){const held=positions.find(p=>String(p.symbol||"").toUpperCase()===String(swingPaperSymbol||"").toUpperCase());if(held)setSwingPaperQuantity(String(held.quantity));}}} style={{padding:10,border:"1px solid #cbd5e1",borderRadius:7}}><option value="BUY">Buy / add long</option><option value="SELL">Sell / reduce long</option></select></label>
+                <label style={{display:"grid",gap:5,fontSize:12,fontWeight:800}}>Quantity<input type="number" min="1" step="1" value={swingPaperQuantity} onChange={e=>setSwingPaperQuantity(e.target.value)} style={{padding:10,border:"1px solid #cbd5e1",borderRadius:7}} /></label>
+                <label style={{display:"grid",gap:7,fontSize:12,fontWeight:800}}>{swingPaperSide==="BUY"?"Entry price (₹)":"Sell price (₹)"}<input type="number" min="0.01" step="0.05" value={swingPaperPrice} onChange={e=>setSwingPaperPrice(e.target.value)} placeholder={swingPaperPriceLoading?"Loading price…":"Enter simulated fill price"} style={{boxSizing:"border-box",minWidth:0,width:"100%",padding:11,border:"1px solid #94a3b8",borderRadius:7,background:"#ffffff",color:"#111827",fontSize:14}} /><span style={{fontWeight:400,color:"#475569",lineHeight:1.45}}>Price auto-fills when you select a symbol. You can edit it; paper orders simulate a fill at the price entered.</span><div style={{display:"flex",gap:8,flexWrap:"wrap",width:"100%"}}><button type="button" onClick={async()=>{const symbol=String(swingPaperSymbol||"").trim().toUpperCase();if(!symbol){setSwingPaperMessage("Enter a stock symbol first.");return;}setSwingPaperPriceLoading(true);try{const q=await fetchJson(`${BACKEND}/api/stock/fast-price?symbol=${encodeURIComponent(symbol)}&refresh=true`);const price=Number(q?.price||q?.ltp);if(!(price>0))throw new Error("No valid quote returned");setSwingPaperPrice(String(price));setSwingPaperMessage(`Latest available reference price loaded for ${symbol}: ₹${price.toFixed(2)}. Please verify before submitting.`);}catch(err){setSwingPaperMessage(`Price refresh failed: ${err?.message||"Quote unavailable"}`);}finally{setSwingPaperPriceLoading(false);}}} disabled={swingPaperPriceLoading||!String(swingPaperSymbol||"").trim()} style={{display:"inline-flex",alignItems:"center",justifyContent:"center",minHeight:42,padding:"10px 14px",border:"1px solid #1d4ed8",borderRadius:8,background:"#eff6ff",color:"#1d4ed8",fontWeight:900,fontSize:13,cursor:swingPaperPriceLoading?"wait":"pointer",visibility:"visible",opacity:1,whiteSpace:"nowrap"}}>{swingPaperPriceLoading?"Refreshing price…":"↻ Refresh price"}</button><button type="button" onClick={async()=>{const symbol=String(swingPaperSymbol||"").trim().toUpperCase();if(!symbol){setSwingPaperMessage("Enter a stock symbol first.");return;}const held=(positions||[]).find(p=>String(p.symbol||"").toUpperCase()===symbol);if(swingPaperSide==="SELL"){if(held)setSwingPaperQuantity(String(held.quantity));else setSwingPaperQuantity("1");}else if(!String(swingPaperQuantity||"").trim()||Number(swingPaperQuantity)<=0){setSwingPaperQuantity("1");}setSwingPaperPriceLoading(true);try{const q=await fetchJson(`${BACKEND}/api/stock/fast-price?symbol=${encodeURIComponent(symbol)}&refresh=true`);const price=Number(q?.price||q?.ltp);if(price>0){setSwingPaperPrice(String(price));if(swingPaperSide==="BUY"){if(!swingPaperStopLoss)setSwingPaperStopLoss((price*0.98).toFixed(2));if(!swingPaperTarget)setSwingPaperTarget((price*1.04).toFixed(2));}setSwingPaperMessage(`Auto-filled ${symbol} paper-trade details. Review quantity, price and risk levels before submitting.`);}else{setSwingPaperMessage("Quantity defaults were filled, but no quote was returned. Use Refresh price or enter a price manually.");}}catch(err){setSwingPaperMessage(`Quantity defaults filled where possible; price lookup failed: ${err?.message||"Quote unavailable"}`);}finally{setSwingPaperPriceLoading(false);}}} disabled={swingPaperPriceLoading||!String(swingPaperSymbol||"").trim()} style={{display:"inline-flex",alignItems:"center",justifyContent:"center",minHeight:42,padding:"10px 14px",border:"1px solid #15803d",borderRadius:8,background:"#f0fdf4",color:"#166534",fontWeight:900,fontSize:13,cursor:swingPaperPriceLoading?"wait":"pointer",visibility:"visible",opacity:1,whiteSpace:"nowrap"}}>Auto-fill details</button></div><span style={{fontWeight:400,color:"#64748b",fontSize:11}}>Auto-fill uses the available quote, defaults quantity when needed, and suggests 2% stop-loss / 4% target for BUY orders if those fields are blank. These are editable illustrative levels, not advice.</span></label>
+                <div style={{gridColumn:"1 / -1",display:"grid",gap:10,marginTop:4,padding:14,border:"2px solid #f59e0b",borderRadius:10,background:"#fffbeb",color:"#78350f",minWidth:0,width:"100%",boxSizing:"border-box"}}>
+                  <div style={{fontSize:14,fontWeight:900}}>STOP-LOSS & TARGET</div>
+                  <div style={{fontSize:12,lineHeight:1.5}}>Set both risk levels for a BUY order. They remain editable. Auto-fill suggests a stop-loss at 2% below the reference price and a target at 4% above it when these fields are blank.</div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:10,minWidth:0}}>
+                    <label style={{display:"grid",gap:6,fontSize:13,fontWeight:900,minWidth:0}}>Stop-loss price (₹)<input aria-label="Stop-loss price in rupees" type="number" min="0.01" step="0.05" value={swingPaperStopLoss} disabled={swingPaperSide!=="BUY"} onChange={e=>setSwingPaperStopLoss(e.target.value)} placeholder="Enter stop-loss price" style={{boxSizing:"border-box",width:"100%",minWidth:0,padding:12,border:"2px solid #d97706",borderRadius:8,background:swingPaperSide!=="BUY"?"#e5e7eb":"#ffffff",color:"#111827",fontSize:14}} /></label>
+                    <label style={{display:"grid",gap:6,fontSize:13,fontWeight:900,minWidth:0}}>Target price (₹)<input aria-label="Target price in rupees" type="number" min="0.01" step="0.05" value={swingPaperTarget} disabled={swingPaperSide!=="BUY"} onChange={e=>setSwingPaperTarget(e.target.value)} placeholder="Enter target price" style={{boxSizing:"border-box",width:"100%",minWidth:0,padding:12,border:"2px solid #d97706",borderRadius:8,background:swingPaperSide!=="BUY"?"#e5e7eb":"#ffffff",color:"#111827",fontSize:14}} /></label>
+                  </div>
+                  {swingPaperSide!=="BUY"&&<div style={{fontSize:12,fontWeight:700}}>Risk levels can be edited for open BUY positions in the Open positions table below.</div>}
+                </div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}><button type="button" disabled={swingPaperBusy} onClick={placeSwingPaperOrder} style={{padding:"11px 16px",border:0,borderRadius:8,background:swingPaperSide==="BUY"?"#15803d":"#b91c1c",color:"#fff",fontWeight:900,cursor:swingPaperBusy?"wait":"pointer",opacity:swingPaperBusy?0.7:1}}>{swingPaperBusy?"Processing…":swingPaperSide==="BUY"?"Paper Buy":"Paper Sell"}</button><button type="button" disabled={swingPaperBusy} onClick={()=>{loadPaperData();setSwingPaperMessage("");}} style={{padding:"11px 12px",border:"1px solid #94a3b8",borderRadius:8,background:"#fff",color:"#334155",fontWeight:800,cursor:"pointer"}}>Refresh</button></div>
+              </div>
+              {swingPaperMessage&&<div role="status" aria-live="polite" style={{marginTop:12,padding:11,borderRadius:8,border:"1px solid #cbd5e1",background:"#f8fafc",color:"#334155",fontSize:13}}>{swingPaperMessage}</div>}
+              <div style={{marginTop:18,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}}><h4 style={{margin:0}}>Open positions</h4><span style={{fontSize:12,color:"#64748b"}}>Starting virtual balance: {formatMoney(paperAccount?.starting_balance ?? 100000)}</span></div>
+              {positions.length===0?<p style={{color:"#64748b",fontSize:13}}>No open paper positions yet. Submit a Paper Buy above to start.</p>:<div style={{overflowX:"auto",marginTop:8}}><table style={{width:"100%",borderCollapse:"collapse",minWidth:1050,fontSize:12}}><thead><tr>{["Symbol","Qty","Avg buy","Latest price","Market value","Unrealized P&L","Stop-loss","Target","Status","Actions"].map(h=><th key={h} style={{padding:8,textAlign:"left",background:"#f8fafc",borderBottom:"1px solid #cbd5e1",whiteSpace:"nowrap"}}>{h}</th>)}</tr></thead><tbody>{positions.map(pos=>{const edit=swingRiskEdits[pos.symbol]||{};const stopVal=edit.stop_loss!==undefined?edit.stop_loss:(pos.stop_loss??"");const targetVal=edit.target_price!==undefined?edit.target_price:(pos.target_price??"");return <tr key={pos.symbol}><td style={{padding:8,borderBottom:"1px solid #e2e8f0",fontWeight:800}}>{pos.symbol}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0"}}>{pos.quantity}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0"}}>{formatMoney(pos.average_price)}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0"}}>{formatMoney(pos.current_price)}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0"}}>{formatMoney(pos.market_value)}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0",fontWeight:800,color:Number(pos.unrealized_pnl)>=0?"#15803d":"#b91c1c"}}>{formatMoney(pos.unrealized_pnl)}</td><td style={{padding:6,borderBottom:"1px solid #e2e8f0"}}><input aria-label={`${pos.symbol} stop-loss`} type="number" value={stopVal} onChange={e=>setSwingRiskEdits(prev=>({...prev,[pos.symbol]:{...(prev[pos.symbol]||{}),stop_loss:e.target.value}}))} style={{width:95,padding:6,border:"1px solid #cbd5e1",borderRadius:5}} /></td><td style={{padding:6,borderBottom:"1px solid #e2e8f0"}}><input aria-label={`${pos.symbol} target`} type="number" value={targetVal} onChange={e=>setSwingRiskEdits(prev=>({...prev,[pos.symbol]:{...(prev[pos.symbol]||{}),target_price:e.target.value}}))} style={{width:95,padding:6,border:"1px solid #cbd5e1",borderRadius:5}} /></td><td style={{padding:8,borderBottom:"1px solid #e2e8f0",whiteSpace:"nowrap",color:pos.risk_status==="ACTIVE"?"#166534":"#b91c1c",fontWeight:800}}>{pos.risk_status==="STOP_LOSS_LEVEL_REACHED"?"Stop level reached":pos.risk_status==="TARGET_LEVEL_REACHED"?"Target reached":"Active"}</td><td style={{padding:6,borderBottom:"1px solid #e2e8f0",whiteSpace:"nowrap"}}><button type="button" onClick={()=>saveSwingPaperRisk(pos)} style={{padding:"6px 8px",border:"1px solid #2563eb",borderRadius:5,background:"#eff6ff",color:"#1d4ed8",fontWeight:800,cursor:"pointer",marginRight:5}}>Save levels</button><button type="button" disabled={swingPaperBusy} onClick={()=>closeSwingPaperPosition(pos)} style={{padding:"6px 8px",border:0,borderRadius:5,background:"#b91c1c",color:"#fff",fontWeight:800,cursor:"pointer"}}>Exit</button></td></tr>})}</tbody></table></div>}
+              <h4 style={{margin:"18px 0 8px"}}>Paper trade history ({trades.length} total)</h4>
+              {trades.length===0?<p style={{color:"#64748b",fontSize:13}}>Trade history will appear here after the first simulated order.</p>:<div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",minWidth:800,fontSize:12}}><thead><tr>{["Time","Symbol","Side","Qty","Fill price","Value","Realized P&L","Stop / target"].map(h=><th key={h} style={{padding:8,textAlign:"left",background:"#f8fafc",borderBottom:"1px solid #cbd5e1",whiteSpace:"nowrap"}}>{h}</th>)}</tr></thead><tbody>{trades.map((trade,i)=><tr key={trade.id||i}><td style={{padding:8,borderBottom:"1px solid #e2e8f0",whiteSpace:"nowrap"}}>{trade.timestamp?formatTradeTimestampIST(trade.timestamp):"—"}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0",fontWeight:800}}>{trade.symbol}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0",color:trade.side==="BUY"?"#15803d":"#b91c1c",fontWeight:800}}>{trade.side}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0"}}>{trade.quantity}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0"}}>{formatMoney(trade.price)}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0"}}>{formatMoney(trade.value)}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0",fontWeight:800,color:Number(trade.realized_pnl||0)>=0?"#15803d":"#b91c1c"}}>{trade.side==="SELL"?formatMoney(trade.realized_pnl||0):"—"}</td><td style={{padding:8,borderBottom:"1px solid #e2e8f0",whiteSpace:"nowrap"}}>{trade.stop_loss==null?"—":formatMoney(trade.stop_loss)} / {trade.target_price==null?"—":formatMoney(trade.target_price)}</td></tr>)}</tbody></table></div>}
             </Card>
             <Card title="Strategy Lab — Intraday, Swing & Derivatives Playbooks">
               <p style={{color:"#475569",lineHeight:1.6,marginTop:0}}>Scan technical setups and run historical strategy tests. Results are research signals, not guaranteed predictions; this workspace does not place orders.</p>
